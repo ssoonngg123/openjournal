@@ -1,0 +1,452 @@
+import { useState } from 'react';
+import { RedactedText } from '../../components/RedactedText.tsx';
+import { ToolUseCard } from '../../components/ToolUseCard.tsx';
+import { colors } from '../../theme.ts';
+import type { ReadySession, RedactedSessionData } from './types.ts';
+import { aggregateCategories, classify, formatTokens, sessionTotalTokens } from './helpers.ts';
+import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
+import { HelpModal, Icon, SourceBadge, StatusDot, ThinkingBlock, UsageDisclosure } from './shared.tsx';
+
+const REVIEW_PAGE_SIZE = 50;
+
+export interface ReviewStepProps {
+  stepperHeader: React.ReactNode;
+  queuedSessions: ReadySession[];
+  redactedSessions: Record<string, RedactedSessionData>;
+  approvedIds: Set<string>;
+  expandedIds: Set<string>;
+  aiPiiEnabled: boolean;
+  onToggleExpand: (id: string) => void;
+  onApprove: (id: string) => void;
+  onExclude: (id: string) => void;
+  onRetryAi: (id: string) => void;
+  onBack: () => void;
+  onPackage: () => void;
+  globalStyles: React.ReactNode;
+  showHelp: boolean;
+  setShowHelp: (b: boolean) => void;
+}
+
+export function ReviewStep(p: ReviewStepProps) {
+  const [visibleCount, setVisibleCount] = useState(REVIEW_PAGE_SIZE);
+  const [showDetails, setShowDetails] = useState(false);
+  const sorted = [...p.queuedSessions].sort((a, b) => {
+    const sa = classify(p.redactedSessions[a.session_id]);
+    const sb = classify(p.redactedSessions[b.session_id]);
+    const order = { blocked: 0, review: 1, checking: 2, clear: 3 };
+    return order[sa] - order[sb];
+  });
+
+  const approvedCount = p.queuedSessions.filter((s) => p.approvedIds.has(s.session_id)).length;
+  const needsReviewCount = p.queuedSessions.filter((s) => (
+    !p.approvedIds.has(s.session_id) && classify(p.redactedSessions[s.session_id]) === 'review'
+  )).length;
+  const blockedCount = p.queuedSessions.filter((s) => classify(p.redactedSessions[s.session_id]) === 'blocked').length;
+  const excludedCount = p.queuedSessions.length - approvedCount;
+  const canPackage = approvedCount > 0;
+  const visibleSessions = sorted.slice(0, visibleCount);
+  const hiddenCount = sorted.length - visibleSessions.length;
+
+  return (
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
+      {p.globalStyles}
+      {p.stepperHeader}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+        <button onClick={p.onBack} style={btnGhost}>&larr; Back to redaction</button>
+      </div>
+      <h1 style={{ margin: '0 0 6px', fontSize: 22, fontWeight: 600, color: colors.gray900 }}>
+        Ready to package
+      </h1>
+      <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
+        Safe traces are included automatically. Anything uncertain stays out unless you
+        choose to review and include it. Failed previews stay excluded until redaction succeeds. This share uses the versions shown here.
+        Later changes stay local for a future share.
+      </p>
+
+      <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
+
+      <div style={{
+        padding: '16px', marginBottom: 14, background: colors.white,
+        border: `1px solid ${colors.gray200}`, borderRadius: 8,
+        display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12,
+      }}>
+        <SummaryStat value={p.queuedSessions.length} label="traces processed" />
+        <SummaryStat value={approvedCount} label="ready to share" color={colors.green500} />
+        <SummaryStat
+          value={excludedCount}
+          label={`not included${needsReviewCount ? ` · ${needsReviewCount} need review` : ''}${blockedCount ? ` · ${blockedCount} preview failed` : ''}`}
+          color={excludedCount > 0 ? colors.yellow700 : colors.gray500}
+        />
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: showDetails ? 12 : 0 }}>
+        <button onClick={() => setShowDetails((shown) => !shown)} style={btnSecondary} aria-expanded={showDetails}>
+          {showDetails ? 'Hide review details' : 'Review details'}
+        </button>
+        {!showDetails && needsReviewCount > 0 && (
+          <span style={{ marginLeft: 10, color: colors.gray500, fontSize: 12.5 }}>
+            Optional: inspect {needsReviewCount} excluded trace{needsReviewCount === 1 ? '' : 's'}.
+          </span>
+        )}
+      </div>
+
+      {showDetails && <div>
+        {visibleSessions.map((s) => (
+          <ReviewRow
+            key={s.session_id}
+            session={s}
+            data={p.redactedSessions[s.session_id]}
+            approved={p.approvedIds.has(s.session_id)}
+            expanded={p.expandedIds.has(s.session_id)}
+            aiPiiEnabled={p.aiPiiEnabled}
+            onToggle={() => p.onToggleExpand(s.session_id)}
+            onApprove={() => p.onApprove(s.session_id)}
+            onExclude={() => p.onExclude(s.session_id)}
+            onRetryAi={() => p.onRetryAi(s.session_id)}
+          />
+        ))}
+        {hiddenCount > 0 && (
+          <div style={{ display: 'flex', justifyContent: 'center', marginTop: 10 }}>
+            <button
+              onClick={() => setVisibleCount((count) => count + REVIEW_PAGE_SIZE)}
+              style={btnSecondary}
+            >
+              Show {Math.min(REVIEW_PAGE_SIZE, hiddenCount)} more
+              <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenCount} remaining)</span>
+            </button>
+          </div>
+        )}
+      </div>}
+
+      <div style={{
+        position: 'sticky', bottom: 0, marginTop: 14, paddingTop: 14,
+        background: `linear-gradient(to top, ${colors.gray50} 40%, rgba(250,248,245,0.95) 80%, transparent)`,
+      }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 14,
+          padding: '12px 14px', background: colors.white,
+          border: `1px solid ${colors.gray200}`, borderRadius: 8,
+          boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+        }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <div style={{ fontSize: 13, color: colors.gray900 }}>
+              {canPackage ? `${approvedCount} trace${approvedCount === 1 ? '' : 's'} ready to package` : 'No traces are included yet'}
+            </div>
+            <div style={{ fontSize: 11.5, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
+              Included traces will be packaged into draft-bundle.zip
+            </div>
+          </div>
+          <div style={{ marginLeft: 'auto' }}>
+            <button
+              onClick={p.onPackage}
+              disabled={!canPackage}
+              style={{ ...btnPrimary, opacity: canPackage ? 1 : 0.4, cursor: canPackage ? 'pointer' : 'not-allowed' }}
+            >
+              <Icon name="check" size={14} />
+              Package {approvedCount} trace{approvedCount === 1 ? '' : 's'}
+            </button>
+          </div>
+        </div>
+      </div>
+      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} aiPiiEnabled={p.aiPiiEnabled} />}
+    </div>
+  );
+}
+
+function SummaryStat({ value, label, color = colors.gray900 }: { value: number; label: string; color?: string }) {
+  return (
+    <div>
+      <div style={{
+        color, fontSize: 22, fontWeight: 600,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontVariantNumeric: 'tabular-nums',
+      }}>{value}</div>
+      <div style={{ color: colors.gray500, fontSize: 12, marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
+function ReviewRow({
+  session, data, approved, expanded, aiPiiEnabled, onToggle, onApprove, onExclude, onRetryAi,
+}: {
+  session: ReadySession;
+  data: RedactedSessionData | undefined;
+  approved: boolean;
+  expanded: boolean;
+  aiPiiEnabled: boolean;
+  onToggle: () => void;
+  onApprove: () => void;
+  onExclude: () => void;
+  onRetryAi: () => void;
+}) {
+  const status = classify(data);
+  const buckets = data?.buckets;
+  const categories = aggregateCategories(data);
+  const totalItems = categories.reduce((s, c) => s + c.count, 0);
+  const borderColor = approved ? colors.green200 : status === 'review' ? colors.yellow200 : colors.gray200;
+  const aiUnavailable = data?.aiCoverage === 'rules_only';
+  const aiDisabled = data?.aiCoverage === 'disabled' || !aiPiiEnabled;
+
+  // Meta label under the title — no raw finding counts, just a neutral phrase.
+  const metaPhrase: string | null = approved ? null : status === 'blocked' ? 'preview failed · cannot include' : status === 'review'
+    ? (aiDisabled ? 'needs review · rules-only' : aiUnavailable ? 'needs review · AI unavailable' : 'needs review')
+    : null;
+  const cannotInclude = !!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading;
+
+  return (
+    <div style={{
+      background: colors.white, border: `1px solid ${borderColor}`,
+      borderRadius: 8, marginBottom: 8, overflow: 'hidden',
+      transition: 'border-color 140ms',
+    }}>
+      <div
+        onClick={onToggle}
+        style={{
+          display: 'grid', gridTemplateColumns: '22px 1fr auto auto',
+          gap: 14, alignItems: 'center', padding: '12px 14px', cursor: 'pointer',
+        }}
+      >
+        <StatusDot status={status} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{
+            fontSize: 13.5, color: colors.gray900,
+            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>
+            {session.display_title || 'Untitled'}
+          </div>
+          <div style={{ fontSize: 11.5, color: colors.gray500, marginTop: 2, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <SourceBadge s={session} />
+            <span>{session.project}</span>
+            <span style={{ opacity: 0.5 }}>&middot;</span>
+            <span>{formatTokens(sessionTotalTokens(session))} tokens</span>
+            {metaPhrase && (<>
+              <span style={{ opacity: 0.5 }}>&middot;</span>
+              <span style={{ color: colors.yellow700 }}>{metaPhrase}</span>
+            </>)}
+          </div>
+          {status === 'clear' && buckets && totalItems > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 4 }}>
+              {buckets.tokens > 0 && <span style={autoChipStyle}>{buckets.tokens} secret{buckets.tokens === 1 ? '' : 's'}</span>}
+              {buckets.emails > 0 && <span style={autoChipStyle}>{buckets.emails} email{buckets.emails === 1 ? '' : 's'}</span>}
+              {buckets.paths > 0 && <span style={autoChipStyle}>{buckets.paths} path{buckets.paths === 1 ? '' : 's'}</span>}
+              {buckets.timestamps > 0 && <span style={autoChipStyle}>{buckets.timestamps} ts</span>}
+              {buckets.urls > 0 && <span style={autoChipStyle}>{buckets.urls} URL{buckets.urls === 1 ? '' : 's'}</span>}
+            </div>
+          )}
+        </div>
+        <div style={{ fontSize: 12, color: colors.gray400 }}>
+          {expanded ? 'Collapse' : 'Inspect'}
+        </div>
+        <div>
+          {approved ? (
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontSize: 12, color: colors.green500, fontWeight: 500,
+            }}>
+              <span style={{
+                width: 16, height: 16, borderRadius: '50%',
+                background: colors.green500, color: colors.white,
+                display: 'grid', placeItems: 'center',
+              }}>
+                <Icon name="check" size={10} />
+              </span>
+              Included
+            </span>
+          ) : (
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontSize: 12, color: colors.gray500,
+            }}>
+              <span style={{
+                width: 16, height: 16, borderRadius: '50%',
+                border: `1.5px dashed ${colors.gray400}`,
+              }} />
+              {status === 'review' ? 'Excluded — needs review' : 'Not included'}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{
+          borderTop: `1px solid ${colors.gray200}`,
+          padding: '16px 18px 18px', background: colors.gray50,
+        }}>
+          <p style={{ fontSize: 13, color: colors.gray700, margin: '0 0 14px', lineHeight: 1.55 }}>
+            {data?.previewError
+              ? 'The preview could not be completed. This trace stays excluded. Go back to redaction and retry after resolving the error.'
+              : status === 'clear'
+              ? <>This trace cleared automatically. Here&rsquo;s the redacted version that will ship &mdash; scan it if you&rsquo;d like extra peace of mind.</>
+              : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}
+          </p>
+
+          {!data?.previewError && (aiUnavailable || aiDisabled) && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 10,
+              padding: '10px 12px', marginBottom: 14,
+              background: colors.yellow50, border: `1px solid ${colors.yellow200}`,
+              borderRadius: 6, fontSize: 12.5, color: colors.gray900,
+            }}>
+              <Icon name="alert" size={14} />
+              <span style={{ color: colors.gray600, marginRight: 'auto' }}>
+                {aiDisabled
+                  ? 'AI review is off for this bundle — only deterministic + policy rules ran on this trace.'
+                  : 'AI review was unavailable — only deterministic + policy rules ran on this trace.'}
+              </span>
+              {!approved && aiUnavailable && (
+                <button
+                  onClick={onRetryAi}
+                  disabled={data?.loading}
+                  style={{
+                    ...btnGhost, color: colors.primary500, fontSize: 12.5,
+                    border: `1px solid ${colors.primary200}`, padding: '4px 8px', background: colors.white,
+                    opacity: data?.loading ? 0.55 : 1,
+                    cursor: data?.loading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <Icon name="retry" size={12} /> {data?.loading ? 'Retrying...' : 'Retry AI'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {data?.previewError ? (
+            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>{data.previewError}</div>
+          ) : data?.loading ? (
+            <div style={{ color: colors.gray500, fontSize: 13 }}>Still analyzing this trace...</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 14 }}>
+              {/* What was redacted summary (compact, category totals) */}
+              <div style={{
+                padding: '12px 14px', background: colors.white,
+                border: `1px solid ${colors.gray200}`, borderRadius: 6,
+                alignSelf: 'start',
+              }}>
+                <h4 style={reviewBoxTitle}>What was redacted</h4>
+                {categories.length === 0 ? (
+                  <div style={{ fontSize: 12.5, color: colors.gray500 }}>
+                    Nothing matched the deterministic rules.
+                    {aiDisabled && <div style={{ marginTop: 4 }}>AI review off.</div>}
+                    {aiUnavailable && !aiDisabled && <div style={{ marginTop: 4 }}>AI review unavailable.</div>}
+                  </div>
+                ) : (
+                  <>
+                    {categories.map((c, i) => (
+                      <div key={i} style={rsItemStyle}>
+                        <span>{c.label}</span>
+                        <span
+                          style={c.source === 'ai' ? {
+                            fontSize: 10, padding: '0 5px', borderRadius: 3,
+                            background: colors.primary100, color: colors.primary500,
+                            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                            fontWeight: 600, letterSpacing: '0.02em',
+                          } : rsItemV}
+                          title={c.source === 'ai' ? 'Flagged by AI' : 'Matched by rules'}
+                        >
+                          {c.source === 'ai' ? 'AI' : '✓'}
+                        </span>
+                      </div>
+                    ))}
+                    <div style={{
+                      ...rsItemStyle, marginTop: 6, paddingTop: 8,
+                      borderTop: `1px solid ${colors.gray200}`, borderBottom: 'none',
+                    }}>
+                      <span>Total</span>
+                      <span style={rsItemV}>{totalItems}</span>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Full redacted preview — scrollable, all messages */}
+              <div>
+                <div style={reviewBoxTitle}>Redacted preview</div>
+                <div style={{
+                  background: colors.white, border: `1px solid ${colors.gray200}`,
+                  borderRadius: 6, padding: '12px 14px',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: 11.5, color: colors.gray700, lineHeight: 1.55,
+                  maxHeight: 420, overflow: 'auto',
+                }}>
+                  {data && data.messages.length === 0 ? (
+                    <div style={{ color: colors.gray400 }}>(no message content)</div>
+                  ) : data && data.messages.map((m, i) => (
+                    <div key={i} style={{
+                      marginBottom: 12, paddingBottom: 10,
+                      borderBottom: i < data.messages.length - 1 ? `1px dashed ${colors.gray200}` : 'none',
+                    }}>
+                      <div style={{
+                        color: m.role === 'user' ? colors.blue500 : colors.primary500,
+                        fontWeight: 600, fontSize: 10.5, textTransform: 'uppercase',
+                        marginBottom: 4,
+                      }}>
+                        {m.role} #{i + 1}
+                      </div>
+                      <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                        <RedactedText text={m.content || ''} />
+                      </div>
+                      {m.thinking && <ThinkingBlock text={m.thinking} />}
+                      {m.tool_uses && m.tool_uses.length > 0 && (
+                        <div style={{ marginTop: 6 }}>
+                          {m.tool_uses.map((t, ti) => (
+                            <ToolUseCard key={ti} tu={t} />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10,
+            paddingTop: 14, marginTop: 14,
+            borderTop: `1px dashed ${colors.gray200}`,
+          }}>
+            <span style={{ fontSize: 12, color: colors.gray500, marginRight: 'auto' }}>
+              {approved
+                ? 'Included with the redactions shown above.'
+                : data?.previewError ? 'A completed preview is required before inclusion.' : 'This trace is currently excluded. Include it only if the redacted version looks good.'}
+            </span>
+            {approved ? (
+              <button onClick={onExclude} style={btnSecondary}>
+                Exclude from bundle
+              </button>
+            ) : (
+              <button onClick={onApprove} disabled={cannotInclude} style={{ ...btnPrimary, opacity: cannotInclude ? 0.4 : 1, cursor: cannotInclude ? 'not-allowed' : 'pointer' }}>
+                <Icon name="check" size={13} />
+                Include in bundle
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const autoChipStyle: React.CSSProperties = {
+  fontSize: 10.5, padding: '1px 7px', borderRadius: 10,
+  background: colors.gray100, color: colors.gray600,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontVariantNumeric: 'tabular-nums',
+};
+
+const reviewBoxTitle: React.CSSProperties = {
+  margin: '0 0 8px', fontSize: 11, textTransform: 'uppercase' as const,
+  letterSpacing: '0.08em', color: colors.gray400, fontWeight: 600,
+};
+
+const rsItemStyle: React.CSSProperties = {
+  display: 'flex', justifyContent: 'space-between',
+  fontSize: 12.5, padding: '4px 0',
+  color: colors.gray600, borderBottom: `1px dashed ${colors.gray200}`,
+};
+
+const rsItemV: React.CSSProperties = {
+  color: colors.green500,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontVariantNumeric: 'tabular-nums',
+};

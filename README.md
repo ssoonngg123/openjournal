@@ -1,0 +1,334 @@
+# OpenJournal
+
+OpenJournal helps you review the work you have done with coding agents, remove sensitive information, and choose what—if anything—you want to share.
+
+It works with Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, WorkBuddy, Cursor, Copilot, and Aider.
+
+## Start with a prompt
+
+Copy the prompt that matches what you want to do into your coding assistant.
+
+### Set it up for me
+
+```text
+Set up or safely update OpenJournal from
+https://github.com/anonymous-org/openjournal.
+
+I have joined the OpenJournal research program. Any data I later explicitly
+choose to contribute through OpenJournal is for research purposes. Program
+participation does not by itself authorize an upload or Automatic uploads.
+
+First determine whether this machine supports a local browser UI or is
+CLI-only/headless. If that is unclear, ask me before installing.
+
+OpenJournal may already be installed even if `openjournal` is not on my
+PATH — check the default locations (`~/.openjournal-venv` and
+`~/openjournal`) before treating this as a fresh install.
+
+If it is not installed yet, install it with the project's installer for my
+operating system: include the browser workbench in UI mode, skip it in
+CLI-only mode, and include the managed sharing safety tools in both. If
+something the installer needs (such as Git, Python, or Node.js) is missing,
+help me install that first.
+
+If it is already installed, run one command for the selected mode:
+`openjournal selfupdate --reinstall --with-frontend --with-sharing` in UI
+mode, or `openjournal selfupdate --reinstall --with-sharing` in CLI-only
+mode. That command brings the selected components to the latest published
+version. It reruns the installer even when the checkout is already current
+so older unrecorded dependency or scanner drift is repaired too.
+
+Either way I must end up on the latest published version; verify that and
+tell me if I am not. Never use force options, and never delete or overwrite
+anything of mine to make an update succeed. If the installer or updater
+reports a problem, show me its message, explain it in plain words, and stop.
+After this setup, OpenJournal keeps itself up to date automatically, so I
+should not need to repeat any of this.
+
+Look across all supported coding agents unless I tell you otherwise. OpenJournal
+defaults to that all-source scope; show me the
+discovered projects before confirming them so I can exclude personal,
+confidential, third-party, or unrelated work.
+
+Use the exact OpenJournal executable printed by the installer; do not assume
+it is on PATH. Scan my sessions and run `openjournal status`.
+
+For UI mode, start and open the local workbench. For CLI-only mode, show me
+my recent sessions and explain the main review commands. Do not start a
+sharing flow yet. If I later request terminal sharing, use
+`openjournal share --interactive --weekly --no-score` unless I explicitly
+opt into AI scoring.
+
+Keep this setup local. Do not run AI scoring, AI-assisted review, or
+Automatic uploads. If any of those features is already enabled, tell me
+before continuing. Do not upload anything.
+
+Finish by reporting: the selected mode; the installed version and whether it
+is the latest published one; the exact executable path; the scan result;
+confirmation that automatic updates are active (or the plain-words reason
+they are not); and the exact command I should use next.
+```
+
+This prompt confirms research-program participation and research intent, but it allows installation and local review only. You can decide whether to contribute data later.
+
+### Open it for me
+
+```text
+Open my local OpenJournal workbench, make sure its session index is current,
+and help me find the work I did recently. Do not run AI features or upload
+anything. If either is already enabled, tell me before opening the workbench.
+
+Before you run any OpenJournal command, make sure my install is current:
+run `openjournal selfupdate --check`, and if it is behind, bring it up to
+date with `openjournal selfupdate --reinstall`. Never discard local changes
+or pass `--force`. If the update is blocked, tell me why and carry on with
+the version I have.
+```
+
+### Help me review my work
+
+```text
+Open OpenJournal and help me review my recent coding-agent sessions.
+
+Before you run any OpenJournal command, make sure my install is current:
+run `openjournal selfupdate --check`, and if it is behind, bring it up to
+date with `openjournal selfupdate --reinstall`. Never discard local changes
+or pass `--force`. If the update is blocked, tell me why and carry on with
+the version I have.
+
+Keep the original session text in the local workbench, not in chat. Help me
+identify useful sessions, exclude anything unrelated, and place anything
+sensitive or uncertain on hold. Do not run AI features, prepare a share, or
+upload anything.
+```
+
+### Help me share safely
+
+```text
+Open OpenJournal and help me prepare a small share from sessions I have
+already reviewed.
+
+Before you run any OpenJournal command, make sure my install is current:
+run `openjournal selfupdate --check`, and if it is behind, bring it up to
+date with `openjournal selfupdate --reinstall` so the redaction rules and
+secret scanners are the latest ones. Never discard local changes or pass
+`--force`. If the update is blocked, tell me why before you prepare anything.
+
+Keep raw traces and secret values in the local workbench or terminal, not in
+chat. Guide me through Queue, Redact, Review, Package, and Submit. Preserve
+every hold, embargo, finding, redaction, consent, and secret-scan safeguard.
+Do not bypass a failed or missing safety check.
+
+Use the built-in redaction rules unless I separately ask for AI-assisted
+review. I have joined the OpenJournal research program, and this one-time
+package is intended as a research contribution. This statement does not
+replace the consent shown at Submit. This request authorizes one manual share
+only; it does not authorize Automatic uploads.
+
+Before anything is uploaded, tell me:
+- how many sessions are selected;
+- which sources and projects they came from;
+- whether redaction and secret scans passed, and whether AI review was used; and
+- where the package would be sent.
+
+Wait for my final confirmation before uploading. If hosted submission is
+unavailable, save the package locally and explain the supported next step.
+```
+
+Sharing is always a separate decision. An assistant permission prompt is not the same as your final approval to upload.
+
+## What you will see
+
+1. **Choose projects.** OpenJournal finds your coding-agent sessions. Review the project list and exclude anything you do not want included.
+2. **Review locally.** Use the browser workbench to search, approve, block, hold, or embargo sessions. No account or upload is required.
+3. **Choose a share.** Select up to 50 reviewed sessions. Anything you do not select stays out of that package.
+4. **Redact and check.** Inspect the redacted preview, remove sessions if needed, and run the required secret scans.
+5. **Confirm.** Review the destination and consent details. Nothing is uploaded until you approve the final submission.
+
+If you are unsure at any point, stop before **Submit**. Your review and package can remain on your computer.
+
+## Privacy in plain English
+
+- **Local by default.** Scanning and reviewing create a local index and local copies of your agent sessions. Those copies can contain the original text.
+- **Problem reports start as local drafts.** **Report a problem** never captures your screen automatically or puts report text in a URL. It builds an editable draft from your description and a small allowlist of path-free diagnostics. Copy, download, and the blank GitHub issue remain local/manual. When a purpose-separated private support receiver is configured, the dialog shows its current purpose and retention terms and offers an explicit **Send privately** action for the exact reviewed Markdown. If that receiver separately advertises optional PNG intake, **Capture masked app view** renders only the visible app viewport with default-deny masking, excludes the reporter, and requires review of the exact full-resolution PNG and SHA-256. The browser talks only to the loopback daemon; the daemon owns durable upload/recovery and whole-report deletion. Logs, traces, hidden diagnostics, and unreviewed screenshots are never attached.
+- **Private report delivery is recoverable.** A queued report is kept in a user-private, SQLite-independent outbox so index failures and daemon restarts cannot lose its state. Ambiguous network results are reconciled by receipt before retrying the same bytes. After acceptance or rejection, the local Markdown is removed; only minimal receipt and management data remain so you can check status or request deletion from **Recent private reports**.
+- **Index recovery is backup-first.** The workbench checks its local SQLite index at startup. If the index is damaged, database-backed work and uploads stay stopped while the UI offers one guided action that backs up the old index before rebuilding it from the original agent logs.
+- **AI features are optional.** If you enable them, OpenJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
+- **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.
+- **Automatic uploads remain off until a successful manual share.** When the hosted recurring terms are available, the final Submit screen selects the combined “submit and enable” action by default, automatically includes every observed recurring-capable source, shows the exact cadence/cap, and links to the full terms and source/project pairs. You can uncheck it before submitting. After the manual receipt is saved, recurring setup is queued locally and continues in the daemon without holding the receipt screen open; closing the browser does not cancel it, and restarting `openjournal serve` resumes it. If automatic uploads are already configured, the same row stays checked and locked; review, pause, or turn them off from Settings. You also keep session-level control without shrinking the enrolled scope: a session you **hold**, **embargo**, or **block** in the workbench is excluded from automatic uploads and shows up in the exclusion counts on the automatic-uploads status.
+- **OpenJournal keeps itself current.** Installs from a git checkout quietly fast-forward to the latest published version (at most once an hour) and, when an update changes dependencies, the workbench, or the pinned scanners, rerun the installer in the background. A running workbench switches to the new version at the next quiet moment (never during a request or right after you changed something) — just reload the page. Updates never touch your local changes, and updating never uploads anything. Set `OPENJOURNAL_NO_AUTO_UPDATE=1` to opt out.
+
+- **One long agent conversation still makes progress.** Claude Code and Codex logs are read incrementally and split only at complete assistant-turn checkpoints after bounded limits are reached. Closed checkpoints can become eligible while you keep using the same conversation; the current unfinished tail stays local.
+
+A trace with an unclear redaction boundary stays local. Other selected traces
+can still be packaged. Exports record skipped session IDs in the manifest;
+terminal commands also report skipped traces. The upload gates still scan every
+exported trace.
+
+Saved Share previews use a bounded local cache. New previews do not evict
+previously reviewed queues. If the 128 MiB cache is full, finish pending shares
+or explicitly clear saved reviews. In Share, select **Clear saved reviews**, or
+run `openjournal review-cache --clear` to remove unused previews. Add `--all`
+to also invalidate pending saved reviews.
+
+For the complete details, see [PRIVACY.md](PRIVACY.md).
+
+## Prefer the terminal?
+
+These are the main commands:
+
+```bash
+openjournal open                         # open the local workbench, then return
+openjournal skill --preview              # preview lessons + one evidence-backed weekly focus
+openjournal skill --install-nudge        # opt in to a stale-lessons SessionStart reminder
+openjournal skill --uninstall-nudge      # disable that reminder and its context output
+openjournal share --interactive --weekly --no-score # guided sharing without AI scoring
+openjournal status                       # check your setup
+openjournal --version                    # show the package version and checkout revision
+openjournal doctor index --json          # collect bounded, path-free index diagnostics
+openjournal storage allow-network        # keep state on cluster/network storage for this machine only
+openjournal selfupdate --check           # see whether a newer version is available
+openjournal selfupdate --reinstall       # update and rerun the installer in one step
+openjournal selfupdate --reinstall --with-frontend --with-sharing # also add UI + managed scanners
+openjournal --help                       # see every command
+```
+
+If `openjournal` is not found, use the full command printed by the installer.
+
+`openjournal open` starts or reuses the local workbench, waits briefly for it to
+be ready, opens your browser, and then returns. `openjournal serve` is the
+foreground, long-running daemon command for manual process management and
+debugging; agents and scripts should not wait for it to exit. On a remote or
+headless machine, use `openjournal serve --remote` in a dedicated terminal or
+background process and follow the SSH tunnel instructions it prints.
+
+On a cluster or another machine whose home directory is on a shared/network
+filesystem, set `OPENJOURNAL_HOME` to a private, persistent local-filesystem
+directory before first use. For an existing install, stop OpenJournal and copy
+the whole state directory together (index, review state, tokens, and local trace
+copies), keeping the original unchanged until recovery succeeds, before setting
+the variable; setting it alone selects a separate state
+root. For example, use `export OPENJOURNAL_HOME=/local/path/openjournal` on
+macOS/Linux or `$env:OPENJOURNAL_HOME='D:\local\openjournal'` in PowerShell.
+OpenJournal refuses to create, open, or rebuild its mutable SQLite index when it
+can positively identify the state directory as a network filesystem. Unknown
+filesystem types keep the existing behavior, so cluster users should still
+confirm the target with their administrator. Do not use an ephemeral node-local
+temporary directory for state that must survive a reboot or job migration.
+
+Many HPC clusters have no private, persistent local storage at all: home is on
+NFS, scratch is on Lustre or GPFS and purged on a schedule, and `/tmp` is wiped
+on reboot. There, keep the state where it is (normally your home directory, not
+purged scratch) and run `openjournal storage allow-network` once. OpenJournal
+then uses its state on network storage from that machine only; it uses SQLite's
+rollback journal, which works on network storage as long as only one machine
+uses it. Every other machine stays blocked so two login nodes can never write
+the index at the same time. To switch machines, stop OpenJournal on the old one
+and run `openjournal storage allow-network --take-over` on the new one. The
+command refuses filesystems that do not support the file locks SQLite needs.
+Keep the index, allowance, and other state in the same directory; a symlink for
+only `index.db` on network storage is refused. If checking the allowance stalls,
+OpenJournal keeps the index blocked and reports that network storage could not
+be checked. Restore access to the mount, then restart OpenJournal.
+
+`openjournal doctor index --json` is read-only and does not require the external
+`sqlite3` command. Its output is deliberately bounded and omits state paths,
+mount sources, hostnames, usernames, and session content, so it can be reviewed
+before attaching it to a support report. On known network storage or while live
+SQLite sidecars are present, it reports that condition without opening the
+database. Do not attach `index.db` itself.
+
+`openjournal skill` uses one optional AI distill call to propose up to five
+coding-agent lessons. Its preview names one human-facing weekly focus only when a
+fresh avoid rule directly cites matching failure or clean-recovery evidence from at
+least 3 sessions across 2 days and 2 projects; otherwise it explicitly abstains when
+no rule also passes its focus safeguards. The spotlight framing and aggregate
+evidence are not installed into agent instructions; the underlying lesson remains in
+the proposed skill set. It does not claim to assess your personality or performance
+at work.
+
+The stale-lessons nudge is **off by default**. If you opt in with
+`openjournal skill --install-nudge`, a due reminder includes aggregate counts of
+new sessions and sessions with failure evidence in agent context, so those counts
+also reach the model provider when the agent starts. It does not include session
+text, run distillation, or install lessons automatically. The count follows your
+confirmed source/project exclusions and hold/embargo boundaries. Disable it at any
+time with `openjournal skill --uninstall-nudge`.
+
+The terminal guide keeps the essential selection, redaction, consent, and destination safeguards in a simpler interface.
+
+<details>
+<summary><b>Manual installation</b></summary>
+
+You need Git, Python 3.10 or newer, and a current LTS version of Node.js.
+
+**macOS, Linux, WSL, or Git Bash**
+
+```bash
+git clone https://github.com/anonymous-org/openjournal.git ~/openjournal
+cd ~/openjournal
+./scripts/install.sh --with-frontend --with-sharing
+```
+
+**Windows PowerShell**
+
+```powershell
+git clone https://github.com/anonymous-org/openjournal.git "$HOME\openjournal"
+Set-Location "$HOME\openjournal"
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -WithSharing
+```
+
+When installation finishes, run `openjournal open`. It starts or reuses the local workbench, opens [http://localhost:8384](http://localhost:8384), and returns once the launch attempt finishes.
+
+Re-running the installer safely updates an existing install to the latest published version. It never overwrites your local changes; if your checkout can't be updated cleanly, it says why and installs the code you already have.
+
+</details>
+
+## A few useful prompts
+
+**Add a desktop shortcut**
+
+```text
+Install or refresh the OpenJournal desktop shortcut, then open the local
+workbench. Check first with `openjournal selfupdate --check` and run
+`openjournal selfupdate --reinstall` if it is behind, without discarding
+local changes. Do not upload anything.
+```
+
+**Find missing WorkBuddy sessions**
+
+```text
+OpenJournal is not finding my WorkBuddy sessions. First check I am on the
+latest version with `openjournal selfupdate --check` and run
+`openjournal selfupdate --reinstall` if I am behind, since source discovery
+improves between versions. Then locate the
+local WorkBuddy export or trace folder, add it to OpenJournal's supported
+import location, rescan, and show me what was found. Keep everything local.
+```
+
+**AnonLab participants**
+
+If you are enrolled in AnonLab Agent Failure Sharing, ask your coding assistant:
+
+```text
+Set up the OpenJournal AnonLab reminder for my coding agents. Preview
+what it will do first. Keep the normal review, confirmation, and sharing
+safeguards in place; the reminder must never upload by itself.
+```
+
+See [ANONLAB_AGENT_FAILURE_SHARING_HOOKS.md](ANONLAB_AGENT_FAILURE_SHARING_HOOKS.md) for enrollment details.
+
+## Project docs
+
+- [PRIVACY.md](PRIVACY.md) — what stays local and what can leave your computer
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how OpenJournal works
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
+- [SECURITY.md](SECURITY.md) — how to report a security issue
+
+## Acknowledgments
+
+OpenJournal builds on early work from [dataclaw](https://github.com/peteromallet/dataclaw) by [@peteromallet](https://github.com/peteromallet).
+
+## License
+
+Apache-2.0

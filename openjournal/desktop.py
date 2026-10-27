@@ -1,0 +1,1319 @@
+"""One-click desktop launcher with a packaged OpenJournal icon.
+
+The shortcut starts the workbench, whose daemon performs an immediate
+background scan.  When the workbench is already running, the launcher asks it
+to scan again and opens the existing instance instead.
+
+No icon assets are downloaded.  The packaged brand artwork is converted into
+the native icon format for each supported desktop platform.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import datetime as dt
+import hashlib
+import json
+import os
+import plistlib
+import secrets
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from . import config as _config
+from .config import load_config
+from .paths import (
+    HEALTH_CHALLENGE_BYTES,
+    api_health_proof,
+    atomic_write_text,
+    ensure_api_token,
+)
+
+
+# Every path below is resolved on each call rather than bound at import time.
+# Binding `CONFIG_DIR` into module constants would pin the real ~/.openjournal
+# even when a caller (notably the autouse `tmp_config` test fixture) has
+# redirected `openjournal.config.CONFIG_DIR` elsewhere — which is how a test
+# run would end up rewriting the user's actual shortcut.
+def _config_dir() -> Path:
+    return _config.CONFIG_DIR
+
+
+def _state_dir() -> Path:
+    return _config_dir() / "desktop"
+
+
+def _icons_dir() -> Path:
+    return _state_dir() / "icons"
+
+
+def _state_file() -> Path:
+    return _state_dir() / "install.json"
+
+
+def _last_opened_file() -> Path:
+    return _state_dir() / "last_opened"
+
+
+def _log_file() -> Path:
+    return _state_dir() / "launcher.log"
+
+
+def _windows_bootstrap() -> Path:
+    return _state_dir() / "windows-launch.py"
+
+
+SHORTCUT_NAME = "OpenJournal"
+LINUX_MANAGED_MARKER = "X-OpenJournal-Managed=true"
+WINDOWS_TASK_NAME = "OpenJournal Desktop Icon"
+MACOS_LAUNCH_AGENT = "org.example.openjournal.desktop-icon"
+LINUX_SYSTEMD_UNIT = "openjournal-desktop-icon"
+
+MAX_SAD_DAYS = 10
+ICON_SIZE = 64
+_PACKAGE_DIR = Path(__file__).resolve().parent
+BRAND_ICON_PATH = _PACKAGE_DIR / "assets" / "desktop-icon.png"
+
+# The shortcut redirects the daemon's stdout/stderr here, and the daemon logs
+# every HTTP request, so the log needs a ceiling to stay bounded over months.
+LOG_MAX_BYTES = 1_000_000
+DESKTOP_COMMAND_TIMEOUT_SECONDS = 30.0
+WORKBENCH_START_TIMEOUT_SECONDS = 30.0
+WORKBENCH_POLL_INTERVAL_SECONDS = 0.25
+WORKBENCH_LOG_TAIL_BYTES = 8_192
+BROWSER_OPEN_TIMEOUT_SECONDS = 5.0
+# Shared environment contract with workbench.daemon.RESTART_CHILD_ENV.  Keep
+# this lightweight launcher independent of importing the full daemon merely
+# to detect its own post-update re-exec.
+_UPDATE_RESTART_CHILD_ENV = "OPENJOURNAL_RESTART_CHILD"
+
+_PORT_FREE = "free"
+_PORT_WORKBENCH = "workbench"
+_PORT_OCCUPIED = "occupied"
+_IPV4_LOOPBACK_HOST = "127.0.0.1"
+_BROWSER_LOOPBACK_HOST = "localhost"
+_NOTE_OPENED_LOCK = threading.Lock()
+_NOTE_OPENED_THREAD_LOCK = threading.Lock()
+_note_opened_thread: threading.Thread | None = None
+
+
+class DesktopError(RuntimeError):
+    """A user-facing desktop integration error."""
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def _home() -> Path:
+    return Path.home()
+
+
+def _platform() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def _package_import_root() -> Path:
+    """Directory Python must search to import this exact OpenJournal build."""
+    return _PACKAGE_DIR.parent
+
+
+def _command(*args: str) -> list[str]:
+    """Use this interpreter and pin the build that installed the shortcut."""
+    entrypoint = (
+        f"import sys; sys.path.insert(0, {str(_package_import_root())!r}); "
+        "from openjournal.cli import main; main()"
+    )
+    return [sys.executable, "-c", entrypoint, *args]
+
+
+def _windows_background_python() -> str:
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return str(pythonw) if pythonw.exists() else sys.executable
+
+
+def _write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(payload)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_state() -> dict[str, Any] | None:
+    try:
+        value = json.loads(_state_file().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_state(state: dict[str, Any]) -> None:
+    atomic_write_text(_state_file(), json.dumps(state, indent=2) + "\n", parents=True)
+
+
+def _write_last_opened(when: dt.datetime | None = None) -> None:
+    stamp = (when or _now()).isoformat(timespec="seconds")
+    atomic_write_text(_last_opened_file(), stamp + "\n", parents=True)
+
+
+def _trim_log() -> None:
+    """Keep the most recent half of an oversized launcher log.
+
+    Truncating in place rather than rotating matters: the POSIX launchers hand
+    the daemon an O_APPEND descriptor, which keeps writing to the open inode.
+    Anything appended between the read and the rewrite is lost, which is an
+    acceptable trade for a diagnostic log we only touch at launch.
+    """
+    try:
+        if _log_file().stat().st_size <= LOG_MAX_BYTES:
+            return
+        with _log_file().open("rb") as handle:
+            handle.seek(-(LOG_MAX_BYTES // 2), os.SEEK_END)
+            raw = handle.read()
+        # Start at a line boundary, but never at the cost of the whole tail:
+        # a log with no newline in this window is one enormous line, and
+        # dropping through to the first newline would empty the file.
+        newline = raw.find(b"\n")
+        tail = raw[newline + 1:] if newline >= 0 else raw
+        if not tail:
+            tail = raw
+        # r+b rather than wb: never leave the log momentarily zero-length.
+        with _log_file().open("r+b") as handle:
+            handle.write(tail)
+            handle.truncate()
+    except OSError:
+        pass
+
+
+def _frontend_available() -> bool:
+    return (Path(__file__).resolve().parent / "web" / "frontend" / "dist" / "index.html").is_file()
+
+
+def _read_last_opened() -> dt.datetime | None:
+    try:
+        opened = dt.datetime.fromisoformat(_last_opened_file().read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return opened if opened.tzinfo else opened.astimezone()
+
+
+# Both helpers compare stored wall-clock dates directly. Reprojecting the
+# stored instant through *today's* UTC offset breaks across a DST boundary:
+# an open at 00:30 on a fall-back day reads as the previous day once the
+# offset shifts that afternoon, flipping the icon to Day 1 on the same day it
+# was used. The stamp already records the local date it was written.
+def days_since_last_opened(now: dt.datetime | None = None) -> int:
+    """Return a local-calendar day count, clamped to the icon range."""
+    opened = _read_last_opened()
+    if opened is None:
+        return 0
+    elapsed = ((now or _now()).date() - opened.date()).days
+    return max(0, min(MAX_SAD_DAYS, elapsed))
+
+
+def opened_today(now: dt.datetime | None = None) -> bool:
+    """Whether an open is already recorded for the current local calendar day."""
+    opened = _read_last_opened()
+    return opened is not None and opened.date() == (now or _now()).date()
+
+
+def render_logo_png() -> bytes:
+    """Return the exact packaged brand artwork used by desktop shortcuts."""
+    try:
+        png = BRAND_ICON_PATH.read_bytes()
+    except OSError as exc:
+        raise DesktopError(f"Packaged desktop icon is unavailable: {BRAND_ICON_PATH}") from exc
+    if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) < 24:
+        raise DesktopError(f"Packaged desktop icon is not a valid PNG: {BRAND_ICON_PATH}")
+    width, height = struct.unpack(">II", png[16:24])
+    if (width, height) != (ICON_SIZE, ICON_SIZE):
+        raise DesktopError(
+            f"Packaged desktop icon must be {ICON_SIZE}x{ICON_SIZE}, got {width}x{height}."
+        )
+    return png
+
+
+def _icon_path(day: int, suffix: str, *, png: bytes | None = None) -> Path:
+    """Return a content-addressed path so desktop shells cannot reuse stale art."""
+    day = max(0, min(MAX_SAD_DAYS, int(day)))
+    digest = hashlib.sha256(png if png is not None else render_logo_png()).hexdigest()[:12]
+    return _icons_dir() / f"openjournal-day-{day}-{digest}.{suffix}"
+
+
+def _ico_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
+    # A 0 in the ICO directory's width/height byte means 256; anything smaller
+    # must state its real dimension.
+    dimension = 0 if size >= 256 else size
+    header = struct.pack("<HHH", 0, 1, 1)
+    entry = struct.pack("<BBBBHHII", dimension, dimension, 0, 0, 1, 32, len(png), 22)
+    return header + entry + png
+
+
+def _icns_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
+    icon_type = b"ic08" if size >= 256 else b"icp6"
+    element = icon_type + struct.pack(">I", len(png) + 8) + png
+    return b"icns" + struct.pack(">I", len(element) + 8) + element
+
+
+def render_icon(day: int) -> None:
+    day = max(0, min(MAX_SAD_DAYS, int(day)))
+    _icons_dir().mkdir(parents=True, exist_ok=True)
+    png = render_logo_png()
+    _write_bytes(_icon_path(day, "png", png=png), png)
+    _write_bytes(_icon_path(day, "ico", png=png), _ico_from_png(png))
+    _write_bytes(_icon_path(day, "icns", png=png), _icns_from_png(png))
+
+
+def render_icon_set() -> None:
+    """Render all variants, primarily useful for previews and packaging."""
+    for day in range(MAX_SAD_DAYS + 1):
+        render_icon(day)
+
+
+def _powershell_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _run_quiet(command: list[str]) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": DESKTOP_COMMAND_TIMEOUT_SECONDS,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        return subprocess.run(command, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            "",
+            f"Command timed out after {DESKTOP_COMMAND_TIMEOUT_SECONDS:g} seconds",
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(command, 127, "", str(exc))
+
+
+def _windows_desktop_dir() -> Path:
+    # FOLDERID_Desktop respects OneDrive and other Explorer redirections.
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    desktop = GUID(
+        0xB4BFCC3A, 0xDB2C, 0x424C,
+        (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41),
+    )
+    path_ptr = ctypes.c_wchar_p()
+    try:
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(desktop), 0, None, ctypes.byref(path_ptr)
+        )
+        if result == 0 and path_ptr.value:
+            return Path(path_ptr.value)
+    finally:
+        if path_ptr:
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+    return _home() / "Desktop"
+
+
+def _desktop_dir(platform_name: str) -> Path:
+    if platform_name == "windows":
+        return _windows_desktop_dir()
+    if platform_name == "linux" and shutil.which("xdg-user-dir"):
+        result = _run_quiet(["xdg-user-dir", "DESKTOP"])
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip())
+    return _home() / "Desktop"
+
+
+def _write_windows_shortcut(path: Path, icon: Path) -> None:
+    _write_windows_bootstrap()
+    args = subprocess.list2cmdline([str(_windows_bootstrap()), "desktop", "launch"])
+    target = _windows_background_python()
+    script = "; ".join([
+        "$w = New-Object -ComObject WScript.Shell",
+        f"$s = $w.CreateShortcut({_powershell_quote(path)})",
+        f"$s.TargetPath = {_powershell_quote(target)}",
+        f"$s.Arguments = {_powershell_quote(args)}",
+        f"$s.WorkingDirectory = {_powershell_quote(_state_dir())}",
+        f"$s.IconLocation = {_powershell_quote(str(icon) + ',0')}",
+        "$s.Description = 'Scan sessions and open the local OpenJournal workbench'",
+        "$s.WindowStyle = 7",
+        "$s.Save()",
+    ])
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        raise DesktopError("Windows PowerShell is required to create the shortcut.")
+    result = _run_quiet([powershell, "-NoProfile", "-NonInteractive", "-Command", script])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "PowerShell could not create the .lnk file"
+        raise DesktopError(detail)
+
+
+def _write_windows_bootstrap() -> None:
+    """Write a no-console entry point that captures even early import errors."""
+    content = "\n".join([
+        '"""Generated OpenJournal desktop entry point."""',
+        "import os",
+        "import subprocess",
+        "from pathlib import Path",
+        "import sys",
+        "import traceback",
+        "",
+        f"package_import_root = {str(_package_import_root())!r}",
+        "sys.path.insert(0, package_import_root)",
+        "",
+        "# pythonw has no console to inherit. Force console-mode children such",
+        "# as Scoop shims to remain invisible instead of flashing a new window.",
+        "if os.name == 'nt':",
+        "    _original_popen = subprocess.Popen",
+        "    _create_no_window = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)",
+        "    _detached_process = 0x00000008",
+        "",
+        "    class _NoConsolePopen(_original_popen):",
+        "        def __init__(self, *args, **kwargs):",
+        "            flags = int(kwargs.get('creationflags', 0))",
+        "            if not flags & _detached_process:",
+        "                kwargs['creationflags'] = flags | _create_no_window",
+        "            super().__init__(*args, **kwargs)",
+        "",
+        "    subprocess.Popen = _NoConsolePopen",
+        "",
+        f"log_path = Path({str(_log_file())!r})",
+        "log_path.parent.mkdir(parents=True, exist_ok=True)",
+        'with log_path.open("a", encoding="utf-8", buffering=1) as log_stream:',
+        "    sys.stdout = log_stream",
+        "    sys.stderr = log_stream",
+        "    try:",
+        "        from openjournal.cli import main",
+        "",
+        "        main()",
+        "    except SystemExit:",
+        "        # A chosen exit code, not a crash: propagate it without",
+        "        # filling the log with a traceback for an ordinary failure.",
+        "        raise",
+        "    except BaseException:",
+        "        traceback.print_exc()",
+        "        raise",
+        "",
+    ])
+    atomic_write_text(_windows_bootstrap(), content, parents=True)
+
+
+def _notify_windows_shortcut(path: Path) -> None:
+    try:
+        ctypes.windll.shell32.SHChangeNotify(0x00002000, 0x0005, str(path), None)
+    except (AttributeError, OSError):
+        pass
+
+
+def _shell_launcher(command: list[str], *, log: bool) -> str:
+    rendered = " ".join(shlex.quote(part) for part in command)
+    suffix = f" >> {shlex.quote(str(_log_file()))} 2>&1" if log else ""
+    return f"#!/bin/sh\ncd {shlex.quote(str(_state_dir()))}\nexec {rendered}{suffix}\n"
+
+
+def _write_executable(path: Path, content: str) -> None:
+    atomic_write_text(path, content, parents=True)
+    path.chmod(0o755)
+
+
+def _linux_desktop_content(launcher: Path, icon: Path) -> str:
+    return "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Version=1.0",
+        f"Name={SHORTCUT_NAME}",
+        "Comment=Scan sessions and open the local OpenJournal workbench",
+        f"Exec={_desktop_exec_quote(launcher)}",
+        f"Icon={icon}",
+        "Terminal=false",
+        "StartupNotify=true",
+        "Categories=Utility;Development;",
+        LINUX_MANAGED_MARKER,
+        "",
+    ])
+
+
+def _desktop_exec_quote(path: Path) -> str:
+    """Quote one executable path using the Desktop Entry Exec grammar.
+
+    The value passes through two unescaping layers — the desktop-file format's
+    own, then Exec's quoting — so a literal backslash needs four in the file.
+    Backslashes are escaped first so the escapes added below are not re-escaped.
+    """
+    value = str(path).replace("\\", "\\\\\\\\")
+    for char in ('"', "`", "$"):
+        value = value.replace(char, "\\" + char)
+    return f'"{value}"'
+
+
+def _linux_entry_is_managed(path: Path) -> bool:
+    try:
+        return LINUX_MANAGED_MARKER in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _macos_app_is_managed(path: Path) -> bool:
+    try:
+        info = plistlib.loads((path / "Contents" / "Info.plist").read_bytes())
+    except Exception:  # noqa: BLE001
+        # Unreadable or unparseable means "cannot prove it is ours", which is
+        # the safe answer. Deliberately broad: plistlib raises
+        # InvalidFileException for a bad header but ExpatError for malformed
+        # XML, and a foreign bundle must not crash install with a traceback.
+        return False
+    return isinstance(info, dict) and info.get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
+
+
+def _windows_shortcut_is_managed(path: Path) -> bool:
+    """A .lnk is ours when it still points at one of our own entry points.
+
+    .lnk is a binary format with no comment field, but the target and argument
+    strings are stored verbatim, so scan the raw bytes for our entry-point
+    names in both the ASCII and UTF-16LE encodings the format mixes.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    return any(
+        token.encode("ascii") in raw or token.encode("utf-16-le") in raw
+        for token in (_windows_bootstrap().name, "openjournal.cli")
+    )
+
+
+def _ensure_available(path: Path, is_managed: Callable[[Path], bool]) -> None:
+    """Refuse to clobber anything at the shortcut path we did not create.
+
+    Ownership is proven by the artifact itself, never by the presence of our
+    install state: a user can delete our shortcut and put their own file at
+    the same path while `install.json` still names it.
+    """
+    if not path.exists() or is_managed(path):
+        return
+    raise DesktopError(f"Refusing to replace an existing item: {path}")
+
+
+def _install_windows(day: int) -> tuple[Path, str, list[str]]:
+    shortcut = _desktop_dir("windows") / f"{SHORTCUT_NAME}.lnk"
+    shortcut.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_available(shortcut, _windows_shortcut_is_managed)
+    # Writes the bootstrap the shortcut and the daily task both point at.
+    _write_windows_shortcut(shortcut, _icon_path(day, "ico"))
+    _notify_windows_shortcut(shortcut)
+
+    task_parts = [
+        _windows_background_python(), str(_windows_bootstrap()),
+        "desktop", "refresh", "--quiet",
+    ]
+    task_command = subprocess.list2cmdline(task_parts)
+    result = _run_quiet([
+        "schtasks.exe", "/Create", "/F", "/SC", "DAILY", "/ST", "09:00",
+        "/TN", WINDOWS_TASK_NAME, "/TR", task_command,
+    ])
+    warnings = []
+    refresh_mode = "daily task"
+    if result.returncode != 0:
+        warnings.append("Could not register the daily icon task; the icon will still update whenever OpenJournal opens.")
+        refresh_mode = "when opened"
+    else:
+        # schtasks.exe defaults to refusing/terminating tasks on battery power,
+        # and to skipping a run outright if the machine was asleep at 09:00.
+        # Windows has no login-time fallback like the macOS and Linux paths, so
+        # -StartWhenAvailable is what keeps a laptop's icon from going stale.
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        settings_script = "; ".join([
+            "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
+            "-DontStopIfGoingOnBatteries -StartWhenAvailable "
+            "-ExecutionTimeLimit (New-TimeSpan -Minutes 5)",
+            f"Set-ScheduledTask -TaskName {_powershell_quote(WINDOWS_TASK_NAME)} "
+            "-Settings $settings | Out-Null",
+        ])
+        settings_result = _run_quiet([
+            str(powershell or "powershell.exe"), "-NoProfile", "-NonInteractive",
+            "-Command", settings_script,
+        ])
+        if settings_result.returncode != 0:
+            warnings.append(
+                "The daily task was installed, but Windows kept its defaults: the icon "
+                "may not refresh on battery or after a missed run."
+            )
+    return shortcut, refresh_mode, warnings
+
+
+def _install_macos(day: int) -> tuple[Path, str, list[str]]:
+    app = _desktop_dir("macos") / f"{SHORTCUT_NAME}.app"
+    _ensure_available(app, _macos_app_is_managed)
+    info = {
+        "CFBundleDisplayName": SHORTCUT_NAME,
+        "CFBundleExecutable": "OpenJournal",
+        "CFBundleIconFile": "OpenJournal",
+        "CFBundleIdentifier": MACOS_LAUNCH_AGENT,
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": SHORTCUT_NAME,
+        "CFBundlePackageType": "APPL",
+        "CFBundleVersion": "1",
+        "LSMinimumSystemVersion": "10.15",
+    }
+    # Stage the bundle alongside the target and swap it in only once complete.
+    # Info.plist is the sole proof of ownership, and it is written last: a
+    # failure partway through an in-place build would leave a bundle that
+    # `_macos_app_is_managed` disowns forever, wedging both install and
+    # uninstall with no way out but a manual `rm -rf`.
+    staging = app.with_name(f".{app.name}.{os.getpid()}.new")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        resources = staging / "Contents" / "Resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        _write_executable(
+            staging / "Contents" / "MacOS" / "OpenJournal",
+            _shell_launcher(_command("desktop", "launch"), log=True),
+        )
+        _write_bytes(
+            resources / "OpenJournal.icns",
+            _icon_path(day, "icns").read_bytes(),
+        )
+        _write_bytes(staging / "Contents" / "Info.plist", plistlib.dumps(info))
+        if app.exists():
+            shutil.rmtree(app)
+        os.replace(staging, app)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    agent = _home() / "Library" / "LaunchAgents" / f"{MACOS_LAUNCH_AGENT}.plist"
+    agent.parent.mkdir(parents=True, exist_ok=True)
+    plist = {
+        "Label": MACOS_LAUNCH_AGENT,
+        "ProgramArguments": _command("desktop", "refresh", "--quiet"),
+        "StartCalendarInterval": {"Hour": 9, "Minute": 0},
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+    }
+    _write_bytes(agent, plistlib.dumps(plist))
+    uid = str(os.getuid()) if hasattr(os, "getuid") else ""
+    _run_quiet(["launchctl", "bootout", f"gui/{uid}", str(agent)])
+    result = _run_quiet(["launchctl", "bootstrap", f"gui/{uid}", str(agent)])
+    warnings = []
+    refresh_mode = "daily LaunchAgent"
+    if result.returncode != 0:
+        warnings.append("Could not load the daily LaunchAgent; it is installed and will be retried at next login.")
+        refresh_mode = "login/when opened"
+    os.utime(app, None)
+    return app, refresh_mode, warnings
+
+
+def _systemd_quote(path: Path) -> str:
+    return '"' + str(path).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _install_linux(day: int) -> tuple[Path, str, list[str]]:
+    desktop = _desktop_dir("linux") / f"{SHORTCUT_NAME}.desktop"
+    desktop.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_available(desktop, _linux_entry_is_managed)
+    launcher = _state_dir() / "launch"
+    refresher = _state_dir() / "refresh"
+    _write_executable(launcher, _shell_launcher(_command("desktop", "launch"), log=True))
+    _write_executable(refresher, _shell_launcher(_command("desktop", "refresh", "--quiet"), log=False))
+    atomic_write_text(
+        desktop,
+        _linux_desktop_content(launcher, _icon_path(day, "png")),
+        parents=True,
+    )
+    desktop.chmod(0o755)
+    if shutil.which("gio"):
+        _run_quiet(["gio", "set", str(desktop), "metadata::trusted", "true"])
+
+    autostart = _home() / ".config" / "autostart" / "openjournal-desktop-icon.desktop"
+    atomic_write_text(
+        autostart,
+        "\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=Refresh OpenJournal icon",
+            f"Exec={_desktop_exec_quote(refresher)}", "Terminal=false", "NoDisplay=true",
+            "X-GNOME-Autostart-enabled=true", LINUX_MANAGED_MARKER, "",
+        ]),
+        parents=True,
+    )
+
+    unit_dir = _home() / ".config" / "systemd" / "user"
+    service = unit_dir / f"{LINUX_SYSTEMD_UNIT}.service"
+    timer = unit_dir / f"{LINUX_SYSTEMD_UNIT}.timer"
+    atomic_write_text(
+        service,
+        "\n".join([
+            "[Unit]", "Description=Refresh the OpenJournal desktop icon", "",
+            "[Service]", "Type=oneshot", f"ExecStart={_systemd_quote(refresher)}", "",
+        ]),
+        parents=True,
+    )
+    atomic_write_text(
+        timer,
+        "\n".join([
+            "[Unit]", "Description=Daily OpenJournal desktop icon refresh", "",
+            "[Timer]", "OnCalendar=daily", "Persistent=true", "RandomizedDelaySec=15m", "",
+            "[Install]", "WantedBy=timers.target", "",
+        ]),
+        parents=True,
+    )
+    warnings = []
+    refresh_mode = "daily systemd timer"
+    if shutil.which("systemctl"):
+        _run_quiet(["systemctl", "--user", "daemon-reload"])
+        result = _run_quiet([
+            "systemctl", "--user", "enable", "--now", f"{LINUX_SYSTEMD_UNIT}.timer"
+        ])
+        if result.returncode != 0:
+            warnings.append("The daily systemd timer could not be enabled; login and launch refreshes remain active.")
+            refresh_mode = "login/when opened"
+    else:
+        refresh_mode = "login/when opened"
+    return desktop, refresh_mode, warnings
+
+
+def install() -> dict[str, Any]:
+    platform_name = _platform()
+    if platform_name not in {"windows", "macos", "linux"}:
+        raise DesktopError(f"Desktop shortcuts are not supported on {platform_name}.")
+    if not _frontend_available():
+        raise DesktopError(
+            "The browser workbench is not built. Re-run the installer with "
+            "`--desktop-shortcut` (macOS/Linux) or `-DesktopShortcut` (Windows)."
+        )
+    previous_state = _read_state()
+    if not _last_opened_file().exists():
+        _write_last_opened()
+    day = days_since_last_opened()
+    render_icon(day)
+    installers = {
+        "windows": _install_windows,
+        "macos": _install_macos,
+        "linux": _install_linux,
+    }
+    shortcut, refresh_mode, warnings = installers[platform_name](day)
+    _remove_previous_shortcut(previous_state, shortcut, platform_name)
+    state = {
+        "version": 1,
+        "platform": platform_name,
+        "shortcut": str(shortcut),
+        "refresh_mode": refresh_mode,
+        "installed_at": _now().isoformat(timespec="seconds"),
+    }
+    _write_state(state)
+    # No refresh() here: each installer already wrote the Day `day` icon and
+    # notified the shell, so refreshing would just rewrite the shortcut again.
+    return {**state, "day": day, "warnings": warnings}
+
+
+def _remove_previous_shortcut(
+    previous_state: dict[str, Any] | None,
+    current: Path,
+    platform_name: str,
+) -> None:
+    """Remove the shortcut our prior state names, once it has moved.
+
+    Covers a rename (a changed SHORTCUT_NAME) and, more importantly, a move:
+    the desktop directory itself can relocate when OneDrive redirection turns
+    on or `xdg-user-dir DESKTOP` changes. Requiring the same parent left that
+    icon orphaned forever, since install.json is immediately rewritten to the
+    new path and uninstall could no longer find the old one. Every branch below
+    still proves ownership from the artifact before deleting anything.
+    """
+    if not previous_state or previous_state.get("platform") != platform_name:
+        return
+    raw_previous = previous_state.get("shortcut")
+    if not isinstance(raw_previous, str) or not raw_previous:
+        return
+    previous = Path(raw_previous)
+    same_path = os.path.normcase(os.path.abspath(previous)) == os.path.normcase(os.path.abspath(current))
+    if same_path:
+        return
+    if platform_name == "windows":
+        if _windows_shortcut_is_managed(previous):
+            _remove_file(previous)
+    elif platform_name == "linux":
+        if _linux_entry_is_managed(previous):
+            _remove_file(previous)
+    elif platform_name == "macos":
+        if _macos_app_is_managed(previous):
+            shutil.rmtree(previous)
+
+
+def _require_managed(path: Path, is_managed: Callable[[Path], bool], kind: str) -> None:
+    """Gate a refresh on the artifact still being present and still being ours.
+
+    Refresh runs unattended — a daily scheduled task, and the daemon's page
+    handler — so it must never resurrect a shortcut the user deleted, nor
+    overwrite a file they put in its place.
+    """
+    if not path.exists():
+        raise DesktopError(f"Desktop {kind} is missing: {path}")
+    _ensure_available(path, is_managed)
+
+
+def _refresh_windows(shortcut: Path, day: int) -> None:
+    _require_managed(shortcut, _windows_shortcut_is_managed, "shortcut")
+    _write_windows_shortcut(shortcut, _icon_path(day, "ico"))
+    _notify_windows_shortcut(shortcut)
+
+
+def _refresh_macos(app: Path, day: int) -> None:
+    _require_managed(app, _macos_app_is_managed, "app")
+    icon = app / "Contents" / "Resources" / "OpenJournal.icns"
+    _write_bytes(icon, _icon_path(day, "icns").read_bytes())
+    os.utime(app, None)
+
+
+def _refresh_linux(shortcut: Path, day: int) -> None:
+    _require_managed(shortcut, _linux_entry_is_managed, "shortcut")
+    launcher = _state_dir() / "launch"
+    atomic_write_text(
+        shortcut,
+        _linux_desktop_content(launcher, _icon_path(day, "png")),
+        parents=True,
+    )
+    shortcut.chmod(0o755)
+
+
+def refresh(*, quiet: bool = False) -> dict[str, Any]:
+    state = _read_state()
+    if state is None:
+        raise DesktopError("The desktop shortcut is not installed. Run `openjournal desktop install` first.")
+    platform_name = str(state.get("platform", ""))
+    shortcut = Path(str(state.get("shortcut", "")))
+    day = days_since_last_opened()
+    if not all(
+        _icon_path(day, suffix).exists()
+        for suffix in ("png", "ico", "icns")
+    ):
+        render_icon(day)
+    refreshers = {
+        "windows": _refresh_windows,
+        "macos": _refresh_macos,
+        "linux": _refresh_linux,
+    }
+    try:
+        refreshers[platform_name](shortcut, day)
+    except KeyError as exc:
+        raise DesktopError(f"Unknown desktop integration platform: {platform_name}") from exc
+    result = {**state, "day": day, "mood": mood_label(day)}
+    if not quiet:
+        print("OpenJournal icon refreshed.")
+    return result
+
+
+def mood_label(day: int) -> str:
+    """Legacy status field retained for clients that already read it."""
+    return "branded logo"
+
+
+def note_opened() -> None:
+    """Record an open only when the optional desktop integration exists.
+
+    Cheap to call repeatedly: the icon only ever changes on a calendar-day
+    boundary, so an open already recorded for today needs no shortcut rewrite.
+    That keeps repeated launcher and background notification calls cheap.
+    """
+    with _NOTE_OPENED_LOCK:
+        if _read_state() is None or opened_today():
+            return
+        _write_last_opened()
+        try:
+            refresh(quiet=True)
+        except (DesktopError, OSError):
+            # Opening the workbench must never fail because Explorer/Finder is busy.
+            pass
+
+
+def note_opened_async() -> bool:
+    """Schedule the desktop refresh without blocking an HTTP request thread.
+
+    Repeated SPA mounts are coalesced while the first notification is active.
+    `note_opened()` retains its own lock because manual `serve` and launcher
+    paths can call it directly at the same time.
+    """
+    global _note_opened_thread
+
+    with _NOTE_OPENED_THREAD_LOCK:
+        if _note_opened_thread is not None and _note_opened_thread.is_alive():
+            return False
+        _note_opened_thread = threading.Thread(
+            target=note_opened,
+            name="openjournal-desktop-open",
+            daemon=True,
+        )
+        _note_opened_thread.start()
+        return True
+
+
+def _daemon_port_is_open(port: int) -> bool:
+    from .cli import _daemon_port_is_open
+
+    return _daemon_port_is_open(port)
+
+
+def _workbench_health_matches(port: int, host: str) -> bool:
+    """Authenticate a loopback endpoint without sending it the API token."""
+    token = ensure_api_token(_config_dir())
+    challenge = secrets.token_hex(HEALTH_CHALLENGE_BYTES)
+    request = urllib.request.Request(
+        f"http://{host}:{port}/.well-known/openjournal?challenge={challenge}",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.75) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    expected_proof = api_health_proof(token, challenge)
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("service") == "openjournal"
+        and isinstance(payload.get("proof"), str)
+        and secrets.compare_digest(payload["proof"], expected_proof)
+    )
+
+
+def _workbench_port_state(port: int) -> str:
+    """Classify the configured port without mistaking another service for us."""
+    if not _daemon_port_is_open(port):
+        return _PORT_FREE
+    if _workbench_health_matches(port, _IPV4_LOOPBACK_HOST):
+        return _PORT_WORKBENCH
+    return _PORT_OCCUPIED
+
+
+def _workbench_browser_url(port: int) -> str:
+    """Preserve the localhost origin only when that exact endpoint is ours."""
+    if _workbench_health_matches(port, _BROWSER_LOOPBACK_HOST):
+        return f"http://{_BROWSER_LOOPBACK_HOST}:{port}/"
+    # This helper is called only after the primary IPv4 listener passed the
+    # authenticated health check. A failed localhost proof can therefore mean
+    # that an unrelated service owns the preferred ::1 endpoint.
+    return f"http://{_IPV4_LOOPBACK_HOST}:{port}/"
+
+
+def _occupied_port_error(port: int) -> DesktopError:
+    return DesktopError(
+        f"Port {port} is already in use by another local service. Stop that "
+        "service or configure a different OpenJournal daemon_port."
+    )
+
+
+def _request_scan(port: int) -> None:
+    token = ensure_api_token(_config_dir())
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/scan",
+        data=b"",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=1.0).close()
+    except (OSError, urllib.error.URLError):
+        pass
+
+
+def _open_browser_once(
+    url: str,
+    *,
+    timeout_seconds: float = BROWSER_OPEN_TIMEOUT_SECONDS,
+) -> bool:
+    """Make one bounded browser-open attempt.
+
+    Some custom ``BROWSER`` commands wait for the browser process to exit.
+    Keep that platform integration from extending the one-shot controller to
+    the browser's lifetime.
+    """
+    finished = threading.Event()
+    result = False
+
+    def _open() -> None:
+        nonlocal result
+        try:
+            result = bool(webbrowser.open(url))
+        except Exception:
+            result = False
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=_open,
+        name="openjournal-browser-open",
+        daemon=True,
+    ).start()
+    if not finished.wait(max(0.0, timeout_seconds)):
+        return False
+    return result
+
+
+def _trigger_self_update() -> None:
+    """Restore the hourly update trigger only after daemon readiness is safe."""
+    try:
+        from .selfupdate import maybe_self_update
+
+        maybe_self_update()
+    except Exception:
+        # Auto-update is always best-effort and must not fail an open request.
+        pass
+
+
+def _render_command(command: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
+
+
+def _workbench_daemon_command(port: int) -> list[str]:
+    return _command(
+        "serve",
+        "--port",
+        str(port),
+        "--no-browser",
+        "--no-port-fallback",
+    )
+
+
+def _detached_process_kwargs(log_stream: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_stream,
+        "stderr": subprocess.STDOUT,
+        "close_fds": True,
+        # Do not let a caller's project directory shadow the installed
+        # `openjournal` package resolved by `python -m`.
+        "cwd": str(_state_dir()),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _spawn_workbench_daemon(
+    port: int,
+) -> tuple[subprocess.Popen[Any], list[str], int]:
+    """Start a strict-port daemon detached from this one-shot controller."""
+    log_path = _log_file()
+    command = _workbench_daemon_command(port)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _trim_log()
+        with log_path.open("ab", buffering=0) as log_stream:
+            header = (
+                f"\n[{_now().isoformat(timespec='seconds')}] "
+                f"Starting: {_render_command(command)}\n"
+            ).encode("utf-8", "replace")
+            log_stream.write(header)
+            log_offset = log_stream.tell()
+            process = subprocess.Popen(
+                command,
+                **_detached_process_kwargs(log_stream),
+            )
+    except OSError as exc:
+        raise DesktopError(
+            "Could not start the OpenJournal workbench.\n"
+            f"Executable: {command[0]}\n"
+            f"Startup command: {_render_command(command)}\n"
+            f"Error: {exc}\n"
+            f"Log: {log_path}\n"
+            "Fix the reported error, then run `openjournal open` again."
+        ) from exc
+    return process, command, log_offset
+
+
+def _wait_for_workbench(
+    process: subprocess.Popen[Any],
+    port: int,
+    timeout_seconds: float,
+) -> bool:
+    """Wait only for authenticated readiness, never for daemon completion."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        port_state = _workbench_port_state(port)
+        if port_state == _PORT_WORKBENCH:
+            return True
+        if process.poll() is not None and port_state == _PORT_FREE:
+            return False
+        # If our strict-bind child exited while the port is occupied, another
+        # launcher may have bound OpenJournal but not started serving requests
+        # yet. Keep authenticating it within the original deadline. A foreign
+        # listener present before spawn was already rejected by launch().
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(WORKBENCH_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _terminate_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    except OSError:
+        pass
+
+
+def _read_launch_log_tail(offset: int) -> str:
+    try:
+        log_path = _log_file()
+        size = log_path.stat().st_size
+        start = max(offset, size - WORKBENCH_LOG_TAIL_BYTES)
+        with log_path.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read()
+    except OSError:
+        return ""
+    if start > offset:
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1:] if newline >= 0 else raw
+    return raw.decode("utf-8", "replace").strip()
+
+
+def _startup_error(
+    *,
+    port: int,
+    process: subprocess.Popen[Any],
+    command: list[str],
+    log_offset: int,
+    timeout_seconds: float,
+    timed_out: bool,
+) -> DesktopError:
+    returncode = process.poll()
+    if timed_out:
+        reason = (
+            f"The workbench did not become ready within "
+            f"{timeout_seconds:g} seconds on port {port}."
+        )
+    else:
+        reason = (
+            f"The workbench process exited before it became ready "
+            f"(exit code {returncode})."
+        )
+    lines = [
+        reason,
+        f"Executable: {command[0]}",
+        f"Startup command: {_render_command(command)}",
+        f"Log: {_log_file()}",
+    ]
+    tail = _read_launch_log_tail(log_offset)
+    if tail:
+        lines.extend(("Last startup output:", tail))
+    lines.append(
+        "Review the startup output, fix the reported error, then run "
+        "`openjournal open` again."
+    )
+    return DesktopError("\n".join(lines))
+
+
+def launch(
+    *,
+    startup_timeout: float = WORKBENCH_START_TIMEOUT_SECONDS,
+) -> str:
+    """Start or reuse the workbench, open it once, and return after readiness."""
+    # pythonw.exe gives Windows a true no-console launcher. Preserve diagnostics
+    # by supplying streams before logging and the daemon are initialized.
+    _trim_log()
+    if sys.stdout is None or sys.stderr is None:
+        _log_file().parent.mkdir(parents=True, exist_ok=True)
+        log_stream = open(_log_file(), "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+        if sys.stdout is None:
+            sys.stdout = log_stream
+        if sys.stderr is None:
+            sys.stderr = log_stream
+    is_restart_child = os.environ.get(_UPDATE_RESTART_CHILD_ENV) == "1"
+    if not is_restart_child:
+        note_opened()
+    config = load_config()
+    port = int(config.get("daemon_port") or 8384)
+    port_state = _workbench_port_state(port)
+    if port_state == _PORT_WORKBENCH:
+        url = _workbench_browser_url(port)
+        if not is_restart_child:
+            _request_scan(port)
+            _open_browser_once(url)
+        _trigger_self_update()
+        return url
+    if port_state == _PORT_OCCUPIED:
+        raise _occupied_port_error(port)
+
+    process: subprocess.Popen[Any] | None = None
+    try:
+        process, command, log_offset = _spawn_workbench_daemon(port)
+        ready = _wait_for_workbench(process, port, startup_timeout)
+    except BaseException:
+        if process is not None:
+            _terminate_process(process)
+        raise
+    if not ready:
+        # Give a daemon that crossed the readiness boundary exactly at the
+        # deadline one final authenticated chance before stopping our child.
+        final_state = _workbench_port_state(port)
+        if final_state == _PORT_WORKBENCH:
+            ready = True
+        else:
+            timed_out = process.poll() is None
+            _terminate_process(process)
+            final_state = _workbench_port_state(port)
+            if final_state == _PORT_WORKBENCH:
+                ready = True
+            elif final_state == _PORT_OCCUPIED and process.poll() is not None:
+                raise _occupied_port_error(port)
+            else:
+                raise _startup_error(
+                    port=port,
+                    process=process,
+                    command=command,
+                    log_offset=log_offset,
+                    timeout_seconds=startup_timeout,
+                    timed_out=timed_out,
+                )
+    url = _workbench_browser_url(port)
+    if not is_restart_child:
+        _request_scan(port)
+        _open_browser_once(url)
+    _trigger_self_update()
+    return url
+
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def uninstall() -> dict[str, Any]:
+    state = _read_state()
+    if state is None:
+        return {"removed": False}
+    platform_name = str(state.get("platform", ""))
+    shortcut = Path(str(state.get("shortcut", "")))
+    if platform_name == "windows":
+        _run_quiet(["schtasks.exe", "/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
+        if _windows_shortcut_is_managed(shortcut):
+            _remove_file(shortcut)
+            _notify_windows_shortcut(shortcut)
+    elif platform_name == "macos":
+        agent = _home() / "Library" / "LaunchAgents" / f"{MACOS_LAUNCH_AGENT}.plist"
+        uid = str(os.getuid()) if hasattr(os, "getuid") else ""
+        _run_quiet(["launchctl", "bootout", f"gui/{uid}", str(agent)])
+        _remove_file(agent)
+        if _macos_app_is_managed(shortcut):
+            shutil.rmtree(shortcut)
+    elif platform_name == "linux":
+        _run_quiet([
+            "systemctl", "--user", "disable", "--now", f"{LINUX_SYSTEMD_UNIT}.timer"
+        ])
+        for suffix in ("service", "timer"):
+            _remove_file(_home() / ".config" / "systemd" / "user" / f"{LINUX_SYSTEMD_UNIT}.{suffix}")
+        _run_quiet(["systemctl", "--user", "daemon-reload"])
+        _remove_file(_home() / ".config" / "autostart" / "openjournal-desktop-icon.desktop")
+        if _linux_entry_is_managed(shortcut):
+            _remove_file(shortcut)
+    else:
+        raise DesktopError(f"Unknown desktop integration platform: {platform_name}")
+
+    # _state_dir() is a fixed child of ~/.openjournal and contains only artifacts
+    # created by this feature.  Resolve and validate before recursive removal.
+    resolved = _state_dir().resolve()
+    if resolved.parent == _config_dir().resolve() and resolved.name == "desktop":
+        shutil.rmtree(resolved, ignore_errors=True)
+    return {"removed": True, "shortcut": str(shortcut)}
+
+
+def status() -> dict[str, Any]:
+    state = _read_state()
+    if state is None:
+        return {"installed": False}
+    shortcut = Path(str(state.get("shortcut", "")))
+    day = days_since_last_opened()
+    return {
+        "installed": shortcut.exists(),
+        **state,
+        "day": day,
+        "mood": mood_label(day),
+    }
+
+
+def run_desktop_command(args: Any) -> int:
+    """CLI adapter kept here so platform details stay out of cli.py."""
+    try:
+        if args.desktop_command == "install":
+            result = install()
+            print(f"[ok] Desktop shortcut installed: {result['shortcut']}")
+            print(f"     Icon refresh: {result['refresh_mode']}")
+            for warning in result["warnings"]:
+                print(f"[!] {warning}")
+            return 0
+        if args.desktop_command == "uninstall":
+            result = uninstall()
+            print("[ok] Desktop shortcut removed." if result["removed"] else "Desktop shortcut is not installed.")
+            return 0
+        if args.desktop_command == "refresh":
+            refresh(quiet=args.quiet)
+            return 0
+        if args.desktop_command == "status":
+            print(json.dumps(status(), indent=2))
+            return 0
+        if args.desktop_command == "launch":
+            launch()
+            return 0
+    except DesktopError as exc:
+        print(f"[x] {exc}", file=sys.stderr)
+        return 1
+    raise DesktopError(f"Unknown desktop command: {args.desktop_command}")
+
+
+def run_open_command() -> int:
+    """CLI adapter for the bounded, one-shot local workbench opener."""
+    try:
+        url = launch()
+    except DesktopError as exc:
+        print(f"[x] {exc}", file=sys.stderr)
+        return 1
+    print(f"[ok] Workbench ready: {url}")
+    return 0

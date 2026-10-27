@@ -1,0 +1,415 @@
+"""CLI boundary checks for ``openjournal skill``."""
+
+from argparse import Namespace
+
+import pytest
+
+from openjournal.cli_skill import _format_install_targets, _print_preview, run_skill
+from openjournal.skill.focus import FocusSpotlight
+from openjournal.skill import store
+from openjournal.skill.schema import SkillRule
+from openjournal.skill.select import SkillCandidate, SkillCorpus
+
+
+def _args(**overrides):
+    values = {
+        "backend": "auto",
+        "model": None,
+        "effort": None,
+        "reject": None,
+        "skip_preflight": True,
+        "all": False,
+        "window_days": 7,
+        "no_scan": True,
+        "no_score": True,
+        "score_limit": 25,
+        "preview": True,
+        "yes": False,
+        "target": None,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_rejects_negative_score_limit(capsys):
+    with pytest.raises(SystemExit) as exc:
+        run_skill(_args(score_limit=-1))
+    assert exc.value.code == 2
+    assert "--score-limit" in capsys.readouterr().out
+
+
+def test_rejects_nonpositive_window(capsys):
+    with pytest.raises(SystemExit) as exc:
+        run_skill(_args(window_days=0))
+    assert exc.value.code == 2
+    assert "--window-days" in capsys.readouterr().out
+
+
+def test_rejects_invalid_distill_effort(monkeypatch, capsys):
+    monkeypatch.setattr("openjournal.scoring.backends.resolve_backend", lambda _backend: "codex")
+    with pytest.raises(SystemExit) as exc:
+        run_skill(_args(effort="max"))
+    assert exc.value.code == 2
+    assert "Unsupported effort for codex" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("targets", "label"),
+    [
+        (["codex"], "Codex"),
+        (["claude"], "Claude Code"),
+        (["claude", "codex"], "Claude Code + Codex"),
+        (["workbuddy", "future-agent"], "WorkBuddy + Future Agent"),
+    ],
+)
+def test_format_install_targets(targets, label):
+    assert _format_install_targets(targets) == label
+
+
+def _preview_result(rule, focus):
+    class Result:
+        rules = [rule]
+        skill_md = ""
+        region = ""
+        blocked = []
+        gate_issues = []
+        corpus = SkillCorpus(
+            window_start="a",
+            window_end="b",
+            total_failures=3,
+            eligible_scored=3,
+        )
+        meta = {}
+        added_fps = {store.fingerprint(rule)}
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    Result.focus = focus
+    return Result()
+
+
+def test_preview_prints_calibrated_human_only_focus(capsys):
+    rule = SkillRule(
+        kind="avoid",
+        title="Recompute Final Badge",
+        trigger="before reporting final status",
+        guidance="re-run final verification and read its result",
+        why="stale intermediate results caused incorrect status reports",
+        taxonomy="verification_skipped",
+    )
+    focus = FocusSpotlight(
+        rule=rule,
+        session_count=3,
+        day_count=2,
+        project_count=2,
+    )
+
+    _print_preview(_preview_result(rule, focus))
+    output = capsys.readouterr().out
+
+    assert "Focus this week (coding-agent behavior; preview spotlight only)" in output
+    assert "Pattern: Recompute Final Badge" in output
+    assert "Observed cost: stale intermediate results" in output
+    assert "Replacement trigger: before reporting final status" in output
+    assert "Replacement habit: re-run final verification" in output
+    assert "Evidence: 3 directly cited sessions across 2 days and 2 projects." in output
+    assert "underlying lesson remains in the proposed skill set" in output
+    assert "work performance" not in output.lower()
+
+
+def test_preview_explicitly_abstains_when_no_focus_is_eligible(capsys):
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w")
+
+    _print_preview(_preview_result(rule, None))
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "passed the focus safeguards" in output
+    assert "at least 3 sessions across 2 days and 2 projects" in output
+
+
+def test_empty_preview_does_not_recommend_unconfirmed_whole_history_scoring(capsys):
+    class Result:
+        rules = []
+        corpus = SkillCorpus(window_start="a", window_end="b")
+        focus = None
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "skill --all --no-score --preview" in output
+    assert "only after confirming whole-history AI scoring" in output
+
+
+def test_empty_preview_abstention_does_not_claim_an_evidence_shortfall(capsys):
+    class Result:
+        rules = []
+        corpus = SkillCorpus(window_start="a", window_end="b")
+        focus = None
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "nothing to spotlight" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
+def test_empty_preview_reports_safety_gate_reasons(capsys):
+    blocked_rule = SkillRule(
+        kind="avoid",
+        title="Personal Judgment",
+        trigger="during review",
+        guidance="the developer is inept",
+        why="the review took longer",
+    )
+
+    class Result:
+        rules = []
+        corpus = SkillCorpus(
+            window_start="a",
+            window_end="b",
+            failures=[
+                SkillCandidate(
+                    session_id="s1",
+                    project="repo",
+                    source="codex",
+                    kind="avoid",
+                )
+            ],
+            total_failures=1,
+        )
+        focus = None
+        blocked = [(blocked_rule, ["unsupported_personal_claim"])]
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "No usable rules this run." in output
+    assert "1 rule(s) dropped by the safety gate" in output
+    assert "Personal Judgment" in output
+    assert "unsupported_personal_claim" in output
+
+
+def test_gate_blocked_preview_abstains_for_the_gate_reason(capsys):
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w")
+    res = _preview_result(rule, None)
+    res.gate_issues = ["secret-scan: generic-api-key"]
+
+    _print_preview(res)
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "render-time gate blocked this run" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
+def test_gate_issues_exit_nonzero(monkeypatch):
+    class Conn:
+        def close(self):
+            pass
+
+    class Result:
+        rules = [SkillRule(kind="avoid", trigger="t", guidance="g", why="w")]
+        skill_md = ""
+        region = ""
+        blocked = []
+        gate_issues = ["trufflehog: trufflehog-error"]
+        corpus = SkillCorpus(window_start="a", window_end="b", total_failures=1)
+        meta = {}
+        added_fps = set()
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    monkeypatch.setattr("openjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
+    monkeypatch.setattr("openjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
+    monkeypatch.setattr("openjournal.workbench.index.open_index", lambda: Conn())
+    monkeypatch.setattr("openjournal.cli_skill.generate_skill", lambda *a, **k: Result())
+    monkeypatch.setattr("openjournal.cli_skill._store.upsert_seen", lambda *a, **k: "fp")
+
+    with pytest.raises(SystemExit) as exc:
+        run_skill(_args())
+    assert exc.value.code == 1
+
+
+def test_preview_persists_proposed_rules_for_rejection(monkeypatch, index_conn):
+    class ConnProxy:
+        def __getattr__(self, name):
+            return getattr(index_conn, name)
+
+        def close(self):
+            pass
+
+    rule = SkillRule(kind="avoid", trigger="t", guidance="rejectable rule", why="w")
+
+    class Result:
+        rules = [rule]
+        skill_md = "md"
+        region = "region"
+        blocked = []
+        gate_issues = []
+        corpus = SkillCorpus(window_start="a", window_end="b", total_failures=1)
+        meta = {}
+        added_fps = {store.fingerprint(rule)}
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    monkeypatch.setattr("openjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
+    monkeypatch.setattr("openjournal.workbench.index.open_index", lambda: ConnProxy())
+    monkeypatch.setattr("openjournal.cli_skill.generate_skill", lambda *a, **k: Result())
+
+    run_skill(_args(preview=True))
+    fp = store.fingerprint(rule)
+    assert fp in {store.fingerprint(r) for r in store.load_kept(index_conn)}
+    assert store.reject(index_conn, fp)
+    assert fp in store.rejected_fingerprints(index_conn)
+
+
+def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path, capsys):
+    class ConnProxy:
+        def __getattr__(self, name):
+            return getattr(index_conn, name)
+
+        def close(self):
+            pass
+
+    class InteractiveStdin:
+        @staticmethod
+        def isatty():
+            return True
+
+    rule = SkillRule(
+        kind="avoid",
+        title="Inspect Runtime First",
+        trigger="before explaining project-specific agent behavior",
+        guidance="inspect the runtime implementation and tool schema before concluding",
+        why="the same assumption caused repeated incorrect explanations",
+        taxonomy="context_handling",
+        support=2,
+    )
+
+    class Result:
+        rules = [rule]
+        skill_md = "unused for a Codex-only install"
+        region = "# Your coding lessons\n\n### Inspect Runtime First\n"
+        blocked = []
+        gate_issues = []
+        corpus = SkillCorpus(window_start="a", window_end="b", total_failures=2)
+        meta = {}
+        added_fps = {store.fingerprint(rule)}
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    # Path.home() reads HOME on POSIX and USERPROFILE on Windows; set both so
+    # the test never writes to the real ~/.codex regardless of platform.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("openjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
+    monkeypatch.setattr("openjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
+    monkeypatch.setattr("openjournal.workbench.index.open_index", lambda: ConnProxy())
+    monkeypatch.setattr("openjournal.cli_skill.generate_skill", lambda *a, **k: Result())
+    monkeypatch.setattr("openjournal.cli_skill.sys.stdin", InteractiveStdin())
+    prompts = []
+
+    def confirm(prompt):
+        prompts.append(prompt)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", confirm)
+
+    args = _args(preview=False, target=["codex"])
+    run_skill(args)
+    assert prompts == ["\nInstall these 1 rule(s) for Codex? [y/N] "]
+
+    agents_path = tmp_path / ".codex" / "AGENTS.md"
+    assert agents_path.exists()
+    assert "Inspect Runtime First" in agents_path.read_text(encoding="utf-8")
+    assert not (tmp_path / ".claude" / "skills" / "openjournal-lessons" / "SKILL.md").exists()
+
+    row = index_conn.execute(
+        "SELECT state, installed_at FROM skill_rules WHERE fingerprint = ?",
+        (store.fingerprint(rule),),
+    ).fetchone()
+    assert row["state"] == "kept"
+    assert row["installed_at"] is not None
+
+    run_skill(args)
+    assert prompts[-1] == "\nInstall these 1 rule(s) for Codex? [y/N] "
+    installed_text = agents_path.read_text(encoding="utf-8")
+    from openjournal.skill import install
+    assert installed_text.count(install.BEGIN_MARKER) == 1
+    assert capsys.readouterr().out.count("Installed:") == 2
+
+
+# --- terminal-control safety on the preview path (Codex round 4) -------------
+
+def test_preview_strips_terminal_control_from_every_untrusted_field(capsys):
+    """Model text, error signatures, and trend keys all reach a TTY.
+
+    An OSC/ANSI payload that survived a session trace must not be able to drive
+    the user's terminal from any preview surface.
+    """
+    from openjournal import cli_skill
+    from openjournal.skill.schema import SkillRule
+    from openjournal.skill.select import SkillCorpus
+
+    osc = "\x1b]0;pwned\x07\x1b[31m"
+    forged = "\r\nInstalled:\tFAKE"
+    rule = SkillRule(
+        kind="avoid", trigger=f"{osc}when editing{forged}",
+        guidance=f"{osc}read the file first{forged}", why=f"{osc}it failed{forged}",
+        title=f"{osc}Read First{forged}", support=3,
+        preview_note=f"{osc}error signature: boom{forged}",
+    )
+    blocked_rule = SkillRule(kind="do", trigger="t", guidance="g", why="w",
+                             title=f"{osc}Blocked One{forged}",
+                             preview_note=f"{osc}blocked signature{forged}")
+    displaced = SkillRule(kind="avoid", trigger="t", guidance="g", why="w",
+                          title=f"{osc}Displaced{forged}", support=4,
+                          preview_note=f"{osc}sig{forged}")
+    res = cli_skill.SkillResult(
+        rules=[rule], skill_md="x", region="y",
+        blocked=[(blocked_rule, [f"url{forged}"])], gate_issues=[f"scanner{forged}"],
+        corpus=SkillCorpus(window_start="a", window_end="b",
+                           objective_recurrence={f"{osc}sig-key{forged}": 3},
+                           objective_session_ids=[f"s{i}" for i in range(12)]),
+        meta={}, added_fps=set(), dropped=[rule],
+        trend={}, objective_trend={f"{osc}sig-key{forged}": (0.5, 0.2)},
+        focus=None, objective_not_installed=[displaced],
+    )
+    cli_skill._print_preview(res)
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "pwned" not in out
+    assert "\r" not in out and "\t" not in out
+    assert "\nInstalled:" not in out
+    assert "Read First" in out and "Displaced" in out and "Blocked One" in out
+
+
+def test_preview_keeps_digest_that_distinguishes_common_prefix_trends(capsys):
+    from openjournal import cli_skill
+    from openjournal.skill.schema import SkillRule
+    from openjournal.skill.select import SkillCorpus
+    from openjournal.skill.turns import _objective_trend_key
+
+    common = "dependency resolver rejected the candidate because its metadata "
+    key_a = _objective_trend_key(common + "alpha-only-conflict")
+    key_b = _objective_trend_key(common + "beta-only-conflict")
+    assert key_a != key_b
+
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w", title="Rule")
+    res = cli_skill.SkillResult(
+        rules=[rule], skill_md="x", region="y", blocked=[], gate_issues=[],
+        corpus=SkillCorpus(window_start="a", window_end="b",
+                           objective_session_ids=[f"s{i}" for i in range(12)]),
+        meta={}, objective_trend={key_a: (0.5, 0.2), key_b: (0.4, 0.1)},
+    )
+    cli_skill._print_preview(res)
+    output = capsys.readouterr().out
+    assert key_a in output and key_b in output
+    assert "alpha-only-conflict" not in output
+    assert "beta-only-conflict" not in output

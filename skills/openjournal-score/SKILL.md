@@ -1,0 +1,94 @@
+---
+name: openjournal-score
+description: Score coding agent sessions for failure value and productivity. Use when the user asks to score a session, score sessions, re-score, auto-score, batch score, or evaluate traces. Triggers on "score sessions", "rate my traces", "quality check", or scoring requests.
+metadata:
+  argument-hint: "<session-id>"
+---
+
+# Score Sessions
+
+## Quick Path: Batch Auto-Score
+
+If no session ID was provided, suggest the automated approach first:
+
+```bash
+# Score in-scope failure-value traces automatically (recommended)
+openjournal score --batch --source failure-corpus --auto-triage --limit 20
+
+# Or without auto-triage:
+openjournal score --batch --source failure-corpus --limit 20
+```
+
+For hands-on scoring of a specific session, continue below.
+With `--auto-triage`, only productivity-1 sessions with failure value 1-2 are
+auto-blocked; failure value 3+ stays reviewable.
+
+## Session Data
+
+Run this to view the session:
+
+```bash
+openjournal score-view <session-id>
+```
+
+If no session ID was provided, list available sessions:
+
+```bash
+openjournal score --batch --limit 10
+```
+
+## Scoring Rubric (1-5)
+
+OpenJournal now records two scores in one pass:
+
+- `ai_quality_score`: legacy productivity/substance score.
+- `ai_failure_value_score`: primary capture score for understanding
+  frontier-agent failure and recovery behavior.
+
+Failure value:
+
+**5 = Canonical high-value trace** — Consequential failure or recovery pattern
+on real expert work, where the agent behavior is the lesson.
+
+**4 = Meaningful failure/recovery** — Worth reviewing or turning into eval/training data.
+
+**3 = Some signal** — Ambiguous, minor, repeated, or mostly environmental.
+
+**2 = Weak signal** — Routine retry, expected debugging, or unclear attribution.
+
+**1 = No useful failure signal** — Smooth success, trivial session, control sample, or noise.
+
+### Labels
+
+Recovery labels: `self_recovered`, `user_corrected_recovery`, `unrecovered`, `blocked`.
+
+Failure attribution: `agent_caused`, `environment`, `preexisting_problem`, `user_redirect`, `unclear`.
+
+Failure modes (`ai_failure_modes`): `task_framing`, `method_selection`, `context_handling`, `execution_error`, `reasoning_fabrication`, `revision_failure`, `verification_skipped`, `deliverable_defect`, `communication_error`, `collaboration_error`, `safety_security`, `efficiency_waste`.
+
+Meta labels (`ai_meta_labels`): `evaluation_measurement` only — emit when the evaluation/measurement setup itself misjudges the agent, not when the agent failed.
+
+Scores of 4 or 5 require at least one `ai_failure_evidence` snippet. A 5/5
+does not require `agent_caused`; non-agent-caused traces can be high value when
+the agent's recovery, uncertainty handling, escalation, or collaboration is the
+lesson.
+
+### Detailed rubric
+
+See `RUBRIC.md` in this directory for the full scoring rubric with examples. In the repo, this file is generated from `openjournal/prompts/agents/scoring/rubric.md`; edit the canonical prompt copy first, then run `python -m openjournal.prompt_sync`.
+- How to read user feedback signals and final user response
+- How to score failure value without punishing normal debugging
+- STEM/domain correction evidence
+- Twelve agent failure modes plus one meta label and recovery labels
+- Structured output fields
+
+## Store the Score
+
+Manual score setting can override failure value directly. Keep `--quality` for
+legacy productivity compatibility only. Failure-value overrides to 4-5 require
+trace-backed evidence.
+
+```bash
+openjournal set-score <session-id> --failure-value <score> --failure-evidence "<trace-backed snippet>" --reason "<1-2 sentence explanation>"
+openjournal set-score <session-id> --quality <score> --reason "<legacy productivity note>"
+```

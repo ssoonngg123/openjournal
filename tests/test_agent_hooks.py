@@ -1,0 +1,516 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from openjournal import agent_hooks as hooks
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    return tmp_path / "home"
+
+
+def _read(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _handlers(document: dict, event: str) -> list[dict]:
+    return [
+        handler
+        for group in document.get("hooks", {}).get(event, [])
+        if isinstance(group, dict)
+        for handler in group.get("hooks", [])
+        if isinstance(handler, dict)
+    ]
+
+
+def test_explicit_home_wins_over_environment_overrides(tmp_path, monkeypatch):
+    """A passed home= must never be redirected into a real config by env vars.
+
+    Without this precedence, running the suite with CLAUDE_CONFIG_DIR or
+    CODEX_HOME set would write test hooks into the developer's real settings.
+    """
+    env_dir = tmp_path / "env-config"
+    home = tmp_path / "home"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(env_dir / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(env_dir / "codex"))
+
+    results = hooks.install_hooks(agent="all", home=home)
+
+    assert [result["agent"] for result in results] == ["claude", "codex"]
+    assert (home / ".claude" / "settings.json").exists()
+    assert (home / ".codex" / "hooks.json").exists()
+    assert not env_dir.exists()
+
+    # Without home=, the env overrides still direct real installs.
+    assert hooks._claude_settings_path() == env_dir / "claude" / "settings.json"
+    assert hooks._codex_hooks_path() == env_dir / "codex" / "hooks.json"
+
+
+def test_install_all_uses_session_start_and_preserves_existing_hooks(isolated_home):
+    claude_path = isolated_home / ".claude" / "settings.json"
+    claude_path.parent.mkdir(parents=True)
+    existing = {
+        "permissions": {"allow": ["Bash(pytest:*)"]},
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "echo keep"}]}],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": (
+                                "python -m openjournal.cli hooks run "
+                                "anonlab-failures --client claude"
+                            ),
+                        }
+                    ]
+                }
+            ],
+        },
+    }
+    claude_path.write_text(json.dumps(existing))
+
+    results = hooks.install_hooks(agent="all", home=isolated_home)
+
+    assert [result["agent"] for result in results] == ["claude", "codex"]
+    claude = _read(claude_path)
+    assert claude["permissions"] == existing["permissions"]
+    assert any(handler["command"] == "echo keep" for handler in _handlers(claude, "SessionStart"))
+    assert any("anonlab-failures" in handler["command"] for handler in _handlers(claude, "Stop"))
+    own = [handler for handler in _handlers(claude, "SessionStart") if hooks._handler_is_ours(handler)]
+    assert own == [hooks._handler_for("claude")]
+
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex = _read(codex_path)
+    own = [handler for handler in _handlers(codex, "SessionStart") if hooks._handler_is_ours(handler)]
+    assert own == [hooks._handler_for("codex")]
+    assert "commandWindows" in own[0]
+    assert "Stop" not in codex["hooks"]
+
+
+def test_install_is_idempotent_and_collapses_stale_duplicates(isolated_home, monkeypatch):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    stale = {
+        "type": "command",
+        "command": "old-python -m openjournal.agent_hooks run --client codex",
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [stale, {"type": "command", "command": "echo keep"}]},
+                        {"hooks": [stale]},
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+
+    first = hooks.install_agent_hook("codex", home=isolated_home)
+    first_bytes = codex_path.read_bytes()
+    second = hooks.install_agent_hook("codex", home=isolated_home)
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert codex_path.read_bytes() == first_bytes
+    document = _read(codex_path)
+    assert sum(hooks._handler_is_ours(handler) for handler in _handlers(document, "SessionStart")) == 1
+    assert any(handler.get("command") == "echo keep" for handler in _handlers(document, "SessionStart"))
+
+
+def test_install_migrates_legacy_profile_hook_and_preserves_foreign_hooks(
+    isolated_home, monkeypatch
+):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": (
+            "old-python -m openjournal.cli auto-upload hook --client codex"
+        ),
+        "commandWindows": (
+            "old-python -m openjournal.cli auto-upload hook --client codex"
+        ),
+        "timeout": 5,
+        "statusMessage": "Checking automatic sharing schedule",
+        "openjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    foreign = {
+        "type": "command",
+        "command": "echo keep",
+        "openjournalProfile": "another-tool",
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy, foreign]},
+                        {"hooks": [legacy]},
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+
+    first = hooks.install_agent_hook("codex", home=isolated_home)
+    first_bytes = codex_path.read_bytes()
+    second = hooks.install_agent_hook("codex", home=isolated_home)
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert codex_path.read_bytes() == first_bytes
+    document = _read(codex_path)
+    handlers = _handlers(document, "SessionStart")
+    own = [handler for handler in handlers if hooks._handler_is_ours(handler)]
+    assert own == [hooks._handler_for("codex")]
+    assert "openjournalProfile" not in own[0]
+    assert foreign in handlers
+
+
+def test_diagnostics_reports_legacy_handler_without_blocking_configured(
+    isolated_home, monkeypatch
+):
+    """A stale legacy handler next to a healthy current hook is a migration
+    chore, not a broken configuration: an unconfigured selected hook blocks
+    scheduled cycles, and nothing reruns install until the next enable."""
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m openjournal.cli auto-upload hook --client codex",
+        "openjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy]},
+                        {"hooks": [hooks._handler_for("codex")]},
+                    ]
+                }
+            }
+        )
+    )
+
+    before = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert before["installed"] is True
+    assert before["configured"] is True
+    assert before["legacy_hook_installed"] is True
+
+    hooks.install_agent_hook("codex", home=isolated_home)
+
+    after = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert after["configured"] is True
+    assert after["legacy_hook_installed"] is False
+    document = _read(codex_path)
+    assert _handlers(document, "SessionStart") == [hooks._handler_for("codex")]
+
+
+def test_diagnostics_marks_legacy_only_install_as_unconfigured(isolated_home):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m openjournal.cli auto-upload hook --client codex",
+        "openjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [legacy]}]}}))
+
+    diagnostics = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert diagnostics["installed"] is True
+    assert diagnostics["configured"] is False
+    assert diagnostics["legacy_hook_installed"] is True
+
+
+def test_uninstall_removes_only_auto_upload_hook_and_is_idempotent(isolated_home):
+    path = isolated_home / ".codex" / "hooks.json"
+    hooks.install_agent_hook("codex", home=isolated_home)
+    document = _read(path)
+    document["hooks"]["SessionStart"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        "old-python -m openjournal.cli auto-upload hook "
+                        "--client codex"
+                    ),
+                    "openjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+                }
+            ]
+        }
+    )
+    document["hooks"]["SessionStart"].append(
+        {"matcher": "startup", "hooks": [{"type": "command", "command": "echo keep"}]}
+    )
+    document["hooks"]["Stop"] = [
+        {"hooks": [{"type": "command", "command": "anonlab-failures"}]}
+    ]
+    path.write_text(json.dumps(document))
+
+    first = hooks.uninstall_agent_hook("codex", home=isolated_home)
+    second = hooks.uninstall_agent_hook("codex", home=isolated_home)
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    document = _read(path)
+    assert not any(hooks._handler_is_ours(handler) for handler in _handlers(document, "SessionStart"))
+    assert any(handler.get("command") == "echo keep" for handler in _handlers(document, "SessionStart"))
+    assert _handlers(document, "Stop")[0]["command"] == "anonlab-failures"
+
+
+def test_malformed_hook_shape_is_rejected_without_rewrite(isolated_home):
+    path = isolated_home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"hooks": {"SessionStart": {"bad": true}}}\n')
+    before = path.read_bytes()
+
+    with pytest.raises(hooks.AgentHookError, match="must be a JSON array"):
+        hooks.install_agent_hook("claude", home=isolated_home)
+
+    assert path.read_bytes() == before
+
+
+def test_multi_agent_install_rolls_back_first_file_when_second_is_invalid(isolated_home):
+    claude_path = isolated_home / ".claude" / "settings.json"
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    claude_path.parent.mkdir(parents=True)
+    codex_path.parent.mkdir(parents=True)
+    claude_path.write_text('{"custom": true}\n')
+    codex_path.write_text('{"hooks": {"SessionStart": {"bad": true}}}\n')
+    claude_before = claude_path.read_bytes()
+    codex_before = codex_path.read_bytes()
+
+    with pytest.raises(hooks.AgentHookError, match="must be a JSON array"):
+        hooks.install_hooks(agent="all", home=isolated_home)
+
+    assert claude_path.read_bytes() == claude_before
+    assert codex_path.read_bytes() == codex_before
+
+
+def test_diagnostics_distinguishes_installed_from_current_and_reports_observation(
+    isolated_home, monkeypatch
+):
+    path = isolated_home / ".codex" / "hooks.json"
+    hooks.install_agent_hook("codex", home=isolated_home)
+
+    configured = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert configured["configured"] is True
+    assert "awaiting hook trust" in configured["diagnostic"]
+
+    observed_at = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    observed = hooks.hook_diagnostics(
+        "codex", home=isolated_home, last_observed_at=observed_at
+    )
+    assert observed["last_observed_at"] == observed_at.isoformat()
+    assert "diagnostic" not in observed
+
+    monkeypatch.setattr(hooks.sys, "executable", "/new/python")
+    stale = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert stale["installed"] is True
+    assert stale["configured"] is False
+    assert path.exists()
+
+
+def test_session_start_records_observation_and_spawns_only_when_due():
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    calls: list[tuple[str, str]] = []
+
+    not_due = hooks.run_session_start(
+        client="claude",
+        now=now,
+        record_observed=lambda client, at: calls.append(("observed", client)),
+        due_check=lambda client, at: hooks.DueDecision(False, "not-due"),
+        spawn_runner=lambda client: calls.append(("spawned", client)) or True,
+    )
+    assert not_due.reason == "not-due"
+    assert not_due.observation_recorded is True
+    assert calls == [("observed", "claude")]
+
+    due = hooks.run_session_start(
+        client="codex",
+        now=now,
+        due_check=lambda client, at: hooks.DueDecision(True, "due"),
+        spawn_runner=lambda client: calls.append(("spawned", client)) or True,
+    )
+    assert due.reason == "runner-spawned"
+    assert due.spawned is True
+    assert calls[-1] == ("spawned", "codex")
+
+
+def test_session_start_adapter_failures_never_escape():
+    def fail(*args):
+        raise RuntimeError("boom")
+
+    due_error = hooks.run_session_start(client="claude", due_check=fail)
+    assert due_error.reason == "due-check-error"
+
+    invalid_result = hooks.run_session_start(
+        client="claude", due_check=lambda client, at: True
+    )
+    assert invalid_result.reason == "due-check-error"
+
+    spawn_error = hooks.run_session_start(
+        client="claude",
+        record_observed=fail,
+        due_check=lambda client, at: hooks.DueDecision(True, "due"),
+        spawn_runner=fail,
+    )
+    assert spawn_error.reason == "runner-spawn-error"
+    assert spawn_error.observation_recorded is False
+
+
+def test_module_entrypoint_is_quiet_and_inert_by_default(capsys):
+    assert hooks.main(
+        ["run", "--client", "codex"], due_check=hooks._runner_not_configured
+    ) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_module_entrypoint_runs_injected_nudge_emitter(capsys):
+    # the lessons nudge is the one deliberate output path (plan §16 CH-1)
+    calls: list[str] = []
+
+    def emit(client: str) -> bool:
+        calls.append(client)
+        print("nudge-line")
+        return True
+
+    assert hooks.main(
+        ["run", "--client", "claude"],
+        due_check=hooks._runner_not_configured,
+        nudge_emitter=emit,
+    ) == 0
+    assert calls == ["claude"]
+    assert "nudge-line" in capsys.readouterr().out
+
+
+def test_module_entrypoint_survives_nudge_emitter_error(capsys):
+    def boom(_client: str) -> bool:
+        raise RuntimeError("nudge failed")
+
+    assert hooks.main(
+        ["run", "--client", "claude"],
+        due_check=hooks._runner_not_configured,
+        nudge_emitter=boom,
+    ) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_module_entrypoint_default_binding_reaches_the_real_nudge(
+    tmp_path, monkeypatch, capsys
+):
+    # the all-adapters-None branch is what every installed hook runs in
+    # production: it must bind the auto-upload adapters AND the lessons nudge.
+    # With no index DB both fail open and print nothing.
+    monkeypatch.setattr("openjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "openjournal.skill.due.emit_session_start_nudge",
+        lambda client: calls.append(client) or True,
+    )
+    assert hooks.main(["run", "--client", "claude"]) == 0
+    assert calls == ["claude"]
+    assert capsys.readouterr().out == ""
+
+
+def test_module_entrypoint_default_binding_fails_open_without_db(
+    tmp_path, monkeypatch, capsys
+):
+    # same production branch, real (unpatched) nudge: a missing index DB must
+    # stay silent and inert end to end.
+    monkeypatch.setattr("openjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    assert hooks.main(["run", "--client", "codex"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_detached_process_options_do_not_inherit_stdio():
+    posix = hooks.detached_process_kwargs(platform="posix")
+    assert posix["start_new_session"] is True
+    assert "creationflags" not in posix
+    assert posix["stdin"] is hooks.subprocess.DEVNULL
+
+    windows = hooks.detached_process_kwargs(platform="nt")
+    assert windows["creationflags"] == 0x00000200 | 0x00000008
+    assert "start_new_session" not in windows
+
+
+def test_session_start_accepts_due_decision_from_a_reimported_module():
+    """Regression: the installed hook runs ``python -m openjournal.agent_hooks``,
+    which executes this module as ``__main__`` while the auto-upload adapter
+    imports it again under its canonical name. The adapter's DueDecision is
+    then a *different class* from the one ``run_session_start`` sees. A class
+    identity check rejected every real decision, fail-open swallowed it as
+    ``due-check-error``, and no scheduled runner was ever spawned."""
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class ForeignDueDecision:  # structurally identical, different class object
+        due: bool
+        reason: str
+
+    spawned: list[str] = []
+    result = hooks.run_session_start(
+        client="claude",
+        due_check=lambda client, at: ForeignDueDecision(True, "due"),
+        spawn_runner=lambda client: spawned.append(client) or True,
+    )
+    assert result.reason == "runner-spawned"
+    assert result.due is True and result.spawned is True
+    assert spawned == ["claude"]
+
+    not_due = hooks.run_session_start(
+        client="codex",
+        due_check=lambda client, at: ForeignDueDecision(False, "not-due"),
+        spawn_runner=lambda client: spawned.append(client) or True,
+    )
+    assert not_due.reason == "not-due"
+    assert spawned == ["claude"]
+
+
+def test_module_executed_as_main_spawns_the_runner(monkeypatch, tmp_path):
+    """Run the module exactly as the installed hook command does
+    (``python -m openjournal.agent_hooks run --client claude``) and assert the
+    default adapters reach the real spawn seam."""
+    import runpy
+    import sys
+
+    from openjournal import auto_upload
+
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        auto_upload,
+        "hook_session_start_check",
+        lambda client, now: hooks.DueDecision(True, "due"),
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "spawn_scheduled_runner",
+        lambda client: spawned.append(client) or True,
+    )
+    monkeypatch.setattr(
+        "openjournal.skill.due.emit_session_start_nudge", lambda client: False
+    )
+    monkeypatch.setattr(sys, "argv", ["agent_hooks", "run", "--client", "claude"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_module("openjournal.agent_hooks", run_name="__main__", alter_sys=True)
+
+    assert exit_info.value.code == 0
+    assert spawned == ["claude"]

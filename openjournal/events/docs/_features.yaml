@@ -1,0 +1,46 @@
+# Single source for `events features --json:features` and the
+# `events docs commands` topic. Plan 08 §events features.
+version: 1
+features:
+  - id: events.ingest
+    command: openjournal events ingest
+    summary: "Drain pending raw execution events into index.db"
+  - id: events.inspect
+    command: openjournal events inspect
+    summary: "Inspect a single event, its vendor line, and any override"
+  - id: events.capabilities
+    command: openjournal events capabilities
+    summary: "Dump the per-client event-type capability matrix"
+  - id: events.aggregate
+    command: openjournal events aggregate
+    summary: "Cross-session aggregation over events (counts/sums/avgs by dimension)"
+  - id: events.search
+    command: openjournal events search
+    summary: "Cross-session full-text search over events.raw_json (FTS5)"
+  - id: events.cost.ingest
+    command: openjournal events cost ingest
+    summary: "Extract token usage and detect cost anomalies"
+  - id: events.cost.aggregate
+    command: openjournal events cost aggregate
+    summary: "Cross-session aggregation over token_usage (auto-partitions by data_source)"
+  - id: events.incidents.detect
+    command: openjournal events incidents detect
+    summary: "Detect exact-repeat command/tool-call loops (loop detector lite)"
+  - id: events.incidents.aggregate
+    command: openjournal events incidents aggregate
+    summary: "Cross-session aggregation over incidents"
+  - id: events.export
+    command: openjournal events export
+    summary: "Package a session into a self-describing replay-bundle JSON"
+  - id: events.import
+    command: openjournal events import
+    summary: "Rehydrate a replay-bundle JSON into local SQLite"
+  - id: events.doctor
+    command: openjournal events doctor
+    summary: "Diagnose this openjournal install (versions, schema, ingest health)"
+  - id: events.features
+    command: openjournal events features
+    summary: "Static product feature surface for AI agents"
+  - id: events.docs
+    command: openjournal events docs
+    summary: "Topic-based docs corpus (guide / commands / schemas / examples / exit-codes / errors)"

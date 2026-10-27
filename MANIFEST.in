@@ -1,0 +1,2 @@
+recursive-include openjournal/prompts *.md
+recursive-include openjournal/web/frontend/dist *

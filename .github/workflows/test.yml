@@ -1,0 +1,89 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest tests/ -v
+
+  windows-selfupdate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e ".[dev]"
+      - run: >-
+          python -m pytest
+          tests/test_selfupdate.py
+          tests/test_install_scripts.py
+          tests/workbench/test_update_restart.py
+          -v
+      - name: One-shot workbench open (native Windows)
+        run: >-
+          python -m pytest
+          tests/test_desktop.py::test_port_probe_requires_a_valid_health_challenge_response
+          tests/test_desktop.py::test_wait_for_workbench_uses_a_fixed_deadline
+          tests/test_desktop.py::test_browser_open_attempt_is_bounded_and_called_once
+          tests/test_desktop.py::test_launch_reuses_live_workbench
+          tests/test_desktop.py::test_launch_starts_daemon_then_scans_and_opens_exactly_once
+          tests/test_desktop.py::test_update_restart_launch_suppresses_launch_only_actions
+          tests/test_desktop.py::test_launch_timeout_terminates_child_and_reports_command_log_and_output
+          tests/test_desktop.py::test_launch_early_exit_terminates_child_and_reports_exit_code
+          tests/test_desktop.py::test_spawn_workbench_daemon_uses_windows_detached_creation_flags
+          tests/test_desktop.py::test_occupied_unknown_port_is_not_opened_or_replaced
+          tests/test_desktop.py::test_losing_the_startup_race_does_not_spawn_a_duplicate
+          tests/test_desktop.py::test_losing_startup_race_to_another_service_reports_an_error
+          tests/test_desktop.py::test_run_server_can_refuse_the_ephemeral_port_fallback
+          tests/test_cli.py::TestWorkbenchSourceChoices::test_open_dispatches_to_one_shot_desktop_controller
+          tests/test_cli.py::TestWorkbenchSourceChoices::test_serve_hidden_no_port_fallback_flag_is_forwarded
+          -v
+      - name: Cross-platform capture and scanner installers
+        run: >-
+          python -m pytest
+          tests/capture
+          tests/redaction/test_betterleaks_install.py
+          tests/redaction/test_trufflehog_install.py
+          -v
+      - name: Deterministic redaction (native Windows)
+        run: python -m pytest tests/redaction/test_prefilter.py tests/redaction/test_prefilter_properties.py tests/redaction/test_consolidated_regressions.py tests/redaction/test_review_72317b7.py tests/redaction/test_review_e419ee3.py tests/workbench/test_review_snapshots.py tests/workbench/test_share_boundary_followup.py tests/test_auto_upload.py::test_unmappable_finding_parks_batch_for_review_instead_of_stalling tests/test_auto_upload.py::test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle tests/test_auto_upload.py::test_mapped_finding_retry_ships_survivors_with_narrowed_scope tests/test_auto_upload.py::test_all_ambiguous_candidates_defer_without_overwriting_release tests/redaction/test_linear_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py tests/redaction/test_scan_entrypoints.py tests/redaction/test_review_regressions.py -v
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: python -m pip install --upgrade pip "setuptools>=77.0" wheel
+      - working-directory: openjournal/web/frontend
+        run: |
+          npm ci
+          npm run lint
+          npm test -- --reporter=dot
+          npm run build
+      - run: test -f openjournal/web/frontend/dist/index.html
+      - run: python -m pip wheel . --no-deps --no-build-isolation -w /tmp/openjournal-wheelcheck
+      - name: Verify wheel contains frontend assets
+        run: |
+          wheel_file=$(ls /tmp/openjournal-wheelcheck/openjournal-*.whl)
+          python -m zipfile -l "$wheel_file" | grep -q 'web/frontend/dist/index.html' \
+            || { echo "wheel missing frontend assets: $wheel_file"; exit 1; }
+      - run: python -m pip install -e .

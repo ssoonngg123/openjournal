@@ -1,0 +1,349 @@
+---
+name: openjournal
+description: Review, curate, share, and learn from coding agent conversation traces. Use when the user asks to review traces, curate sessions, manage their workbench, export conversations, share a trace, review PII/secrets in exports, or distill recurring coding-agent lessons and a weekly focus. Triggers on "review traces", "share traces", "openjournal", "my sessions", "what did I work on", "improve my Codex usage", "what coding habit should I change", or self-improving-skill requests.
+---
+
+# OpenJournal
+
+OpenJournal helps you review, curate, and share coding agent traces from Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline.
+
+## Prerequisite
+
+```bash
+command -v openjournal >/dev/null 2>&1 && echo "openjournal: installed" || echo "openjournal not found — run /openjournal-setup first"
+```
+
+If openjournal is not installed, tell the user to run `/openjournal-setup` (or invoke the openjournal-setup skill) first.
+
+## Communication Guidelines
+
+**Adapt to the user's technical level.** When interacting with non-technical users (especially via Telegram, Discord, or other messaging channels):
+
+- **Never show raw commands, UUIDs, file paths, or CLI flags.** Run the commands yourself and present only the human-readable results.
+- **Never expose infrastructure details.** Do not show GCS bucket addresses, ingest service URLs, Cloud Function endpoints, or any internal system identifiers. If the JSON output contains fields like `gcs_uri`, `bundle_hash`, or `device_id`, suppress them entirely.
+- **Use simple, non-technical language.** Say "your sessions" not "indexed sessions in the workbench DB." Say "uploaded" not "shared via ingest service."
+- **When asked "how to use openjournal"** — don't write a reference manual. Instead, run the commands yourself and guide the user interactively step by step.
+
+**Always show what was redacted.** When sharing data, the share result includes a `redaction_summary` with `total_redactions` and `by_type`. Always present this to the user:
+
+> Your data has been cleaned before sharing:
+> - 3 API keys redacted
+> - 2 JWT tokens redacted
+> - 1 database URL redacted
+> - All file paths anonymized, usernames hashed
+>
+> 5 sessions uploaded successfully.
+
+If `total_redactions` is 0, still reassure:
+
+> Your data was scanned for secrets, API keys, tokens, and PII — nothing sensitive was found. All file paths were anonymized and usernames hashed. 5 sessions uploaded.
+
+**Never skip the redaction report.** The user must always know their data was checked and what (if anything) was removed.
+
+## Two Modes
+
+OpenJournal has two workflows:
+
+1. **Workbench Mode** — Review and curate traces (local-first, scientist-facing)
+2. **Export Mode** — Bulk export to local JSONL
+
+Default to **Workbench Mode** unless the user specifically asks about bulk export.
+
+---
+
+## Workbench Mode
+
+When the user asks to review traces, curate sessions, look at their work history, or manage data:
+
+### Quick Start
+
+```bash
+openjournal scan                              # Index sessions into local DB
+openjournal inbox --json --limit 15           # Show trace cards (JSON for you to parse)
+```
+
+Parse the JSON output. Each session has: `index`, `session_id`, `display_title`, `source`, `model`, `messages`, `tokens`, `outcome_badge`, `value_badges`, `risk_badges`, `review_status`.
+
+Present the traces to the user as a numbered list showing title, source, badges, and status. Then ask: **"Quick triage here, or open the full review UI?"**
+
+**On a remote VM?** Skip the browser — do the full review right here in the terminal. Follow the Review & Share steps below.
+
+### Review & Share
+
+**Step 1 — Scan & score**
+
+```bash
+openjournal scan
+openjournal score --batch --source failure-corpus --auto-triage
+```
+
+`--source failure-corpus` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
+
+Present summary:
+
+> Found 47 sessions. 23 scored. Failure-value 4-5: 9 (high-value failure traces — review first). Productivity-1 low-failure-value noise: 8 auto-archived. 16 still need review.
+
+Ask:
+> How would you like to review?
+> - **"review here"** — I'll show the session list and we'll triage together (works everywhere)
+> - **"open UI"** — I'll launch the workbench in your browser
+
+If user chooses the UI:
+
+```bash
+openjournal open
+```
+
+This starts or reuses the local daemon, waits a bounded time for readiness, opens
+the browser, and then returns. Continue the conversation after the command
+returns; do not wait for a foreground daemon to exit.
+
+Tell user: "Workbench is open at localhost:8384. Triage sessions in the Inbox, then come back and say 'share' when ready."
+
+For remote VMs: use `openjournal serve --remote` in a dedicated terminal or
+background process and follow the SSH tunnel command it prints. `serve` is a
+foreground, long-running daemon command; do not wait for it to exit.
+
+When user returns, continue to Step 2.
+
+**Step 2 — Show preview**
+
+```bash
+openjournal share --status approved --preview --json
+```
+
+Parse the JSON. Present up to 10 sessions at a time:
+
+> 23 approved sessions. Here are the first 10:
+>
+> 1. Fix auth bug (failure 5 · productivity 5) — Agent's first patch broke a different test; user corrected; agent recovered with the right fix.
+> 2. Refactor DB layer (failure 1 · productivity 4) — Clean refactor, no failure signal.
+> 3. Add parser tests (failure 4 · productivity 4) — Agent claimed coverage; tests didn't actually exercise the new branch until user pointed it out.
+> ...
+
+Failure value is shown first because it's the primary signal for this corpus — a high failure value means the trace teaches something about agent behavior (failures + recoveries), independent of whether the work succeeded.
+>
+> You can:
+> - Remove sessions: "remove 4"
+> - Inspect one: "show me 4"
+> - See more: "next 10"
+> - Add a comment: "note: my week 12 traces"
+> - Confirm all: "looks good" or "share"
+
+**Step 3 — Handle user feedback (loop until confirmed)**
+
+If user says "remove 4, 7":
+
+```bash
+openjournal block <id-for-4> <id-for-7> --reason "user excluded"
+```
+
+Then re-run preview and present updated list.
+
+If user says "show me 4":
+
+```bash
+openjournal score-view <id-for-4>
+```
+
+Present the condensed session transcript, then return to the preview.
+
+If user adds a note, remember it for the `--note` flag.
+
+If user says "looks good" / "share" / "yes" — proceed to Step 4.
+
+**Step 4 — Package with confirmation**
+
+Only after explicit user confirmation:
+
+```bash
+openjournal betterleaks status --json >/dev/null 2>&1 || openjournal betterleaks install
+openjournal trufflehog status --json >/dev/null 2>&1 || openjournal trufflehog install
+openjournal bundle-create --status approved --note "<user's comment>" --json
+openjournal bundle-export <bundle_id> --zip --json
+```
+
+Run the scanner checks yourself. The packaging preflight also repairs missing managed scanners, but this explicit check gives the user a clear installation result before the final package step. Never ask the user to install Betterleaks or TruffleHog with Homebrew.
+
+Parse the export result and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `OPENJOURNAL_INGEST_URL`; use the workbench Share tab's Submit step so email verification, consent, and receipt handling happen in the UI. If the destination is not configured, tell the user the redacted zip is ready on their computer.
+
+### Quick Share
+
+For quickly sharing a single trace — no approval workflow, no bundles:
+
+**Step 1 — Show recent sessions**
+
+```bash
+openjournal recent --json --limit 5
+```
+
+Present as a numbered list:
+
+> Recent sessions:
+>
+> 1. Auth Middleware Fix — 23 min · 4/5 · Tests passed
+> 2. Debug Memory Leak — 45 min · 3/5 · Tests failed
+> 3. Add Parser Tests — 12 min · 5/5 · Tests passed
+>
+> Reply "share 1" to send a card, or "details 2" for more info.
+
+**Step 2 — User picks a session**
+
+```bash
+openjournal card <session-id> --depth summary --json
+```
+
+The `card_text` field is pre-formatted and ready to send.
+
+**Depth options** (user can specify, or choose based on context):
+- `--depth workflow` — safe for public channels (no content, just tool sequence + stats)
+- `--depth summary` — safe for team channels (task descriptions, no code) **← default**
+- `--depth full` — for trusted recipients (full redacted content)
+
+### Quick Triage (without scoring)
+
+For manual triage without AI scoring:
+
+```bash
+openjournal inbox --json --limit 15
+```
+
+Show numbered list. Take instructions like "approve 1,3,5" or "block 2":
+
+```bash
+openjournal approve <session-id> [session-id ...] --reason "good debugging trace"
+openjournal block <session-id> [session-id ...] --reason "contains proprietary code"
+```
+
+Map the user's index numbers to session_ids from the inbox JSON output.
+
+### Full Review (web UI)
+
+```bash
+openjournal open
+```
+
+Starts or reuses the local workbench, opens a browser at `localhost:8384`, and
+returns after a bounded readiness check. The workbench includes:
+- **Inbox**: Trace cards with value/risk/outcome badges and one-click triage
+- **Search**: Full-text search across all session transcripts
+- **Session Detail**: Three-pane view (timeline | transcript | metadata)
+- **Bundles**: Assemble and export curated upload sets
+- **Policies**: Manage redaction rules and project exclusions
+
+---
+
+## Self-Improving Lessons
+
+When the user asks what recurring coding-agent behavior to improve, preview the
+local distilled lessons:
+
+```bash
+openjournal skill --preview
+```
+
+If the preview reports no scored sessions, retry once with
+`openjournal skill --all --no-score --preview` to use already-scored history without
+starting a whole-history scoring run. If that is also empty, explain the gap and ask
+before running `--all` without `--no-score`. Present the single **Focus this week**
+as a coding-agent behavior with its observed cost, replacement trigger, replacement
+habit, and evidence breadth. If the command abstains, report that no eligible
+evidence-backed focus was available; do not invent a generic critique or diagnose
+the user's personality or performance at work. Do not infer exact evidence from
+stored support counts or old `case-NN` aliases. Install or refresh the generated
+lessons only when the user asks, using `openjournal skill` and its confirmation flow.
+
+---
+
+## Export Mode
+
+When the user asks to bulk export their conversations locally:
+
+### THE RULE
+
+**Every `openjournal` command outputs `next_steps`. FOLLOW THEM.**
+
+Do not memorize the flow. Do not skip steps. Do not improvise.
+Run the command → read the output → follow `next_steps`. That's it.
+
+### Getting Started
+
+Run `openjournal status` (or `openjournal prep` for full details) and follow the `next_steps`.
+
+### Output Format
+
+- `openjournal prep`, `openjournal config`, `openjournal status`, and `openjournal confirm` output pure JSON
+- `openjournal export` outputs human-readable text followed by `---OPENJOURNAL_JSON---` and a JSON block
+- Always parse the JSON and act on `next_steps`
+
+### PII Audit
+
+After `openjournal export --no-push`, follow the `next_steps` in the JSON output. The flow is:
+
+1. **Ask the user their full name** — then grep the export for it
+2. **Run the pii_commands** from the JSON output and review results with the user
+3. **Ask the user what else to look for** — company names, client names, private URLs, other people's names, custom domains
+4. **Deep manual scan** — sample ~20 sessions (beginning, middle, end) and look for anything sensitive the regex missed
+5. **Fix and re-export** if anything found: `openjournal config --redact "string"` then `openjournal export --no-push`
+6. **Run `openjournal confirm` with text attestations** — pass `--full-name`, `--attest-full-name`, `--attest-sensitive`, and `--attest-manual-scan`
+
+---
+
+## Command Reference
+
+```bash
+# Quick Share
+openjournal recent [--source openclaw] [--since today] [--limit 5] [--json]
+openjournal card <id> [--depth workflow|summary|full] [--json]
+
+# Triage & Review
+openjournal scan [--source claude|codex|openclaw]
+openjournal inbox [--status new|shortlisted|approved|blocked] [--limit 20] [--json]
+openjournal approve <id> [id ...] [--reason "..."]
+openjournal block <id> [id ...] [--reason "..."]
+openjournal shortlist <id> [id ...]
+openjournal search <query> [--json] [--limit 20]
+
+# Scoring
+openjournal score --batch [--source failure-corpus] [--auto-triage] [--limit 20]
+openjournal rescore --window 7d [--source failure-corpus] [--limit 200]
+openjournal score-view <id>
+openjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
+openjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
+
+# Self-improving lessons
+openjournal skill [--preview] [--all]
+
+# Advanced self-hosted ingest upload
+openjournal share --status approved [--note "..."] [--preview] [--json]  # package locally; hosted submit is workbench-only
+
+# Bundles
+openjournal bundle-create [ids ...] [--status approved]
+openjournal bundle-list
+openjournal bundle-view <bundle_id>
+openjournal bundle-export <bundle_id> [--zip]
+openjournal bundle-share <bundle_id>  # self-hosted ingest only
+
+# Export (bulk)
+openjournal status
+openjournal prep [--source all|claude|codex|gemini|opencode|openclaw]
+openjournal config --source all
+openjournal config --exclude "a,b"
+openjournal config --redact "str1,str2"
+openjournal config --redact-usernames "u1,u2"
+openjournal config --confirm-projects
+openjournal export [--no-push] [--no-thinking] [--pii-review --pii-apply]
+openjournal confirm --full-name "NAME" --attest-full-name "..." --attest-sensitive "..." --attest-manual-scan "..."
+
+# Workbench
+openjournal open
+openjournal serve [--port 8384] [--no-browser] [--remote]
+```
+
+## Gotchas
+
+- **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
+- **`openjournal inbox --json`** is the preferred way for agents to read trace data.
+- **`openjournal open`** is the local UI command for agents: it starts or reuses the daemon, opens the browser, and returns after a bounded readiness check.
+- **`openjournal serve`** is a foreground, long-running daemon command. Use it only when explicitly managing the process (including `--remote`); do not wait for it to exit.
+- **Everything is local by default** — nothing leaves the machine unless the user explicitly submits from the workbench or uses a configured self-hosted ingest command.

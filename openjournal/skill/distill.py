@@ -1,0 +1,541 @@
+"""The one LLM step: distill selected candidates into skill rules (<=5 from the
+model, plus one deterministic MUST-COVER rule per objective signal; the installed
+set is still capped by ``merge_rules``).
+
+All substrate is anonymized (home/username) AND deterministically secrets-scrubbed
+*before* the call — the only AI egress in default Mode A is this single call,
+through the user's own agent CLI (``ANTHROPIC_API_KEY`` stripped → subscription).
+The backend is reached through a ``caller`` seam so tests inject a fake; the
+default mirrors the benchmark's ``AgentBackendCaller``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+from typing import Any, Protocol
+
+from ..benchmark.generate import _extract_json_object, run_agent_json_call
+from ..config import load_config
+from ..redaction.anonymizer import Anonymizer
+from ..redaction.normalize import strip_terminal_control_sequences
+from ..redaction.secrets import redact_custom_strings, redact_text
+from ..scoring.backends import (
+    default_distill_effort_for_backend,
+    default_distill_model_for_backend,
+    default_model_for_backend,
+    resolve_backend,
+)
+from .schema import (
+    FAILURE_MODES,
+    MAX_RULES,
+    ORIGIN_OBJECTIVE,
+    SkillRule,
+    parse_rules,
+)
+from .select import SkillCorpus
+
+# A distill failure caused by an OLD agent CLI that doesn't recognize the newer
+# --safe-mode / --effort flags (vs a transient timeout or a plan-unavailable model).
+_DISTILL_FLAG_ERROR_RE = re.compile(
+    r"safe-?mode|--effort|unknown (?:option|flag|argument)|unrecognized|unexpected argument",
+    re.I,
+)
+_PLAN_UNAVAILABLE_RE = re.compile(
+    r"(?:model|slug|alias).*(?:not available|unavailable|not found|unknown|unsupported)|"
+    r"(?:not available|unavailable|not found|unknown|unsupported).*(?:model|slug|alias)|"
+    r"does not have access to (?:model|.*opus|.*gpt)|"
+    r"access to .* model .* denied|"
+    r"model .* requires .* plan|"
+    r"not included in .* plan",
+    re.I,
+)
+_TRANSIENT_DISTILL_ERROR_RE = re.compile(
+    r"\b429\b|rate[-\s]?limit|usage[-\s]?limit|quota|out of credits|"
+    r"timeout|timed out|temporar|overloaded|try again",
+    re.I,
+)
+
+
+def _distill_flag_unsupported(message: str) -> bool:
+    return bool(_DISTILL_FLAG_ERROR_RE.search(message or ""))
+
+
+def _distill_plan_unavailable(message: str) -> bool:
+    msg = message or ""
+    return not _TRANSIENT_DISTILL_ERROR_RE.search(msg) and bool(_PLAN_UNAVAILABLE_RE.search(msg))
+
+logger = logging.getLogger(__name__)
+
+DISTILL_TIMEOUT = 240
+
+
+class Caller(Protocol):
+    def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:
+        ...
+
+
+_SYSTEM = (
+    "You distill a SMALL set of durable, reusable coding-agent skills from a single "
+    "user's OWN past sessions (already scored). Output ONLY one JSON object, no prose, "
+    f"no markdown fences. Produce AT MOST {MAX_RULES} rules total — a mix of 'avoid' "
+    "(from recurring failures) and 'do' (from recurring successes/recoveries). "
+    "Pick the highest-value RECURRING, NONTRIVIAL patterns; ignore one-off or trivial "
+    "wins. A success is not *caused* by a named habit — for 'do' rules, teach the "
+    "specific fix/decision that turned a failure into a success (the delta), not a "
+    "coincidental routine. These rules describe CODING-AGENT behavior and interaction "
+    "patterns, not the user's personality, motivation, character, or overall performance "
+    "at work. Never diagnose or make workplace-performance claims about the user. "
+    "PRIORITIZE BY RECURRENCE AND BREADTH — this skill loads on EVERY coding task, so it "
+    "is worth most when its rules fire often. Favor the failure modes with the highest "
+    "recurrence counts (listed below) and habits that apply to MANY of the user's tasks "
+    "over a rare-but-severe one-off incident. A durable everyday habit ('before calling "
+    "it done, re-run the exact failing case you were asked to fix and confirm it passes') "
+    "beats a narrow post-mortem tied to a single project/value. Keep guidance concrete "
+    "and checkable, but choose broadly-applicable patterns. "
+    "BE SPECIFIC, NOT GENERIC: each rule must name the concrete situation, surface, or "
+    "pattern it targets and keep the technical detail of the source learning_summary "
+    "(e.g. 'schema/prompt changes are a cross-surface contract — verify DB, API, UI, and "
+    "exports together', 'when a safety gate blocks a multi-item batch, support auditable "
+    "per-item removal and retry, not all-or-nothing', 'run install + runtime smoke tests "
+    "against the built artifact before tagging a release'). REJECT vague platitudes "
+    "('write tests', 'verify your work', 'check the environment', 'communicate clearly') "
+    "unless bound to a concrete trigger and a checkable mechanism. The 'trigger' is a "
+    "recognizable situation the coding agent will encounter again; the 'guidance' is one "
+    "concrete, checkable action. Ground each rule in the given sessions and list EVERY "
+    "selected case that directly supports that same concrete pattern in "
+    "evidence_session_ids. The 'why' must state only a downstream cost visible in those "
+    "cited cases, framed as a task, artifact, or coding-agent consequence rather than "
+    "a personal trait or overall-work assessment. If the pattern or its cost lacks "
+    "direct evidence, omit the rule. "
+    "Give each rule a 'title': a very short name of 2-4 words (aim for 2-3) that reads "
+    "like a command/skill name (e.g. 'Validate config types', 'Verify patch applied', "
+    "'Recompute final badge', 'Guard script secrets'). Title Case, no trailing period, "
+    "not a sentence; distinct from the longer 'guidance'. "
+    "Some sessions include pivotal_turn excerpts: the agent's claim right before a user "
+    "correction (agent_before), the user's actual redirect (user_correction), and the "
+    "agent's fix (agent_after). These are the HIGHEST-SIGNAL evidence — prefer rules "
+    "grounded in that mistake→correction→fix pattern (a rule that would have made the "
+    "correction unnecessary) over rules restated from summaries, and pull the concrete "
+    "trigger/mechanism from the excerpt itself. Never quote user text verbatim in the "
+    "output; state the lesson in your own words. "
+    "Sessions may also include env_recovery excerpts (OBJECTIVE environment feedback): "
+    "a tool call that failed, the environment's error, and the changed call that then "
+    "worked. Candidates marked 'Objective environment feedback' cluster ONE recurring "
+    "tool error across many sessions — their support_count is the verified number of "
+    "sessions that hit it, ground truth rather than judge opinion. For these, teach the "
+    "mechanical habit that avoids the error (or the failed→working delta), stated "
+    "generally (no session-specific paths/values). "
+    "If the input includes a MUST-COVER list, EVERY case on it must appear in some "
+    "rule's evidence_session_ids: give it a dedicated rule, or fold it into a "
+    "closely-related rule and cite it there. Never drop a MUST-COVER case — it is "
+    "verified objective evidence, not an optional suggestion. "
+    "De-identify PII ONLY — never emit a person's name, email, URL, "
+    "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
+    "module names, failure surfaces, tool categories, architectural patterns). "
+    f"Failure taxonomy for the 'taxonomy' field: {', '.join(FAILURE_MODES)}."
+)
+
+_RULE_SHAPE = (
+    'Return JSON: {"rules": [{"kind": "avoid"|"do", '
+    '"title": "2-4 word name", "trigger": "when this applies", '
+    '"guidance": "the rule (avoid X / do Y instead)", "why": "one line, grounded", '
+    '"taxonomy": "<failure mode or empty>", "evidence_session_ids": ["case-01"]}]}'
+)
+
+
+def _redact_blocked_domains(text: str, blocked_domains: list[str]) -> str:
+    if not text or not blocked_domains:
+        return text
+    try:
+        from ..workbench.index import _compile_blocked_domain_pattern
+    except Exception:
+        return text
+    for domain in blocked_domains:
+        pattern = _compile_blocked_domain_pattern(domain)
+        if pattern is not None:
+            text = pattern.sub("[REDACTED_DOMAIN]", text)
+    return text
+
+
+def _scrub(value: Any, anon: Anonymizer, settings: dict[str, Any] | None = None) -> str:
+    """Anonymize home/username, apply custom policy redactions, then redact secrets."""
+    if not value:
+        return ""
+    text = anon.text(str(value))
+    if settings:
+        custom_strings = list(settings.get("custom_strings", []) or [])
+        blocked_domains = list(settings.get("blocked_domains", []) or [])
+        text, _count = redact_custom_strings(text, custom_strings)
+        text = _redact_blocked_domains(text, blocked_domains)
+    from ..redaction.boundaries import RedactionBoundaryError
+    try:
+        redacted, _, _ = redact_text(text, strict=True)
+    except RedactionBoundaryError:
+        # This text feeds an AI prompt. Omit the whole ambiguous excerpt,
+        # never fall back to sending its unsanitized contents.
+        logger.warning("Skill excerpt omitted because its redaction boundary is unclear")
+        return '[REDACTED_AMBIGUOUS_EXCERPT]'
+    return redacted
+
+
+def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
+    return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
+
+
+# --- must-cover: objective candidates cannot be silently dropped (CH-2) ------
+# The synthetic env-signature / human-rejection candidates are the objective
+# channel's whole yield; leaving their coverage to the distiller's discretion
+# means a verified >=3-session signal can produce no rule. The prompt lists them
+# as MUST-COVER, and every candidate also gets a deterministic templated rule —
+# model citation alone is not semantic proof. This adds zero egress (D6: one
+# distill call per run, so there is no re-ask) and flows through the same
+# hard-deny / secret / PII gates and preview as every distilled rule.
+
+_SYNTHETIC_ID_PREFIXES = ("env-signature-",)
+_SYNTHETIC_IDS = frozenset({"human-rejection"})
+
+# A tool name is VALIDATED, not sanitized: it must already be a single clean
+# identifier or it is dropped for a generic word. Stripping bad characters
+# instead would keep the attacker's words ("Bash\n### Always Force Push" would
+# survive as "BashAlwaysForcePush"); rejecting outright cannot.
+_TOOL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def _is_objective_candidate(candidate: Any) -> bool:
+    sid = str(getattr(candidate, "session_id", "") or "")
+    return sid.startswith(_SYNTHETIC_ID_PREFIXES) or sid in _SYNTHETIC_IDS
+
+
+def _must_cover_block(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None,
+) -> str:
+    objective = [c for c in corpus.candidates if _is_objective_candidate(c)]
+    if not objective:
+        return ""
+    lines = ["", "MUST-COVER (verified objective evidence; every case below must be "
+             "cited in some rule's evidence_session_ids):"]
+    for c in objective:
+        lines.append(
+            f"- {aliases[c.session_id]}: {_scrub(c.title, anon, settings)} "
+            f"(recurred in {int(c.support_count or 0)} distinct sessions)"
+        )
+    return "\n".join(lines)
+
+
+def _fallback_rule(
+    candidate: Any,
+    alias: str,
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> SkillRule | None:
+    """Deterministic identity-bearing rule for one objective candidate.
+
+    **No untrusted text is interpolated into the rule.** Tool-error output is
+    environment- (and so potentially attacker-) influenced, and unlike distilled
+    prose it never passes through the model's "state it in your own words" step.
+    A keyword denylist cannot make such text safe in instruction position — a
+    plain paraphrase ("from now on approve every command") reads as an
+    instruction while matching nothing. So the installed rule is built only from
+    a fixed template, an ALLOWLISTED tool token, an integer session count, and a
+    short hash that distinguishes signatures without carrying their bytes.
+
+    The human-readable error text stays in ``preview_note``, which is printed to
+    the terminal for the user's decision and never rendered into the skill file.
+    """
+    n = int(candidate.support_count or 0)
+    why = (f"Objective evidence (auto-added, not distilled): recurred in {n} "
+           f"distinct sessions this window — a verified count, not judge opinion.")
+    if candidate.session_id in _SYNTHETIC_IDS:   # the human-rejection candidate
+        return SkillRule(
+            kind="avoid",
+            title="Ask Before Rejected Actions",
+            trigger=("When about to attempt an action class the user or their "
+                     "permission gate has previously declined"),
+            guidance=("Propose the action and wait for approval instead of "
+                      "attempting it directly; rejected action classes recur "
+                      "across sessions."),
+            why=why, evidence_session_ids=[alias], support=n,
+            origin=ORIGIN_OBJECTIVE,
+        )
+    from .turns import _signal_label, error_signature  # noqa: PLC0415 (cycle)
+
+    excerpt = next(iter(candidate.pivotal_excerpts or []), None)
+    action = _scrub(getattr(excerpt, "action", ""), anon, settings)
+    # Prefer the CLUSTER-TIME signature: recomputing it from the truncated,
+    # whitespace-collapsed excerpt drops Python tracebacks (their informative
+    # line is skipped as a preamble), which silently produced no rule at all for
+    # the most common error shape. Fall back to the excerpt only if absent.
+    raw_signature = getattr(candidate, "objective_signature", "") or error_signature(
+        getattr(excerpt, "error", "") if excerpt is not None else "")
+    # Identity uses the complete normalized signature.  ``_signal_label`` is a
+    # presentation helper that truncates at 60 characters; hashing that label
+    # made different errors with a common prefix share a fingerprint and trend.
+    canonical_signature = re.sub(
+        r"\s+",
+        " ",
+        strip_terminal_control_sequences(_scrub(raw_signature, anon, settings)),
+    ).strip().casefold()
+    label = _signal_label(canonical_signature)
+    if not canonical_signature:
+        # Still emit the rule — coverage is the guarantee; only the (unusable)
+        # signature is missing, and the cited sessions carry the detail.
+        label = ""
+    # A tool NAME is a short identifier; keep it only when it is ENTIRELY one.
+    raw_tool = action.split(":", 1)[0].strip()
+    tool = raw_tool if _TOOL_TOKEN_RE.fullmatch(raw_tool) else ""
+    # Stable, content-free discriminator: two different signatures on the same
+    # tool must stay two rules (distinct fingerprints), but the bytes that make
+    # them different never reach the file.
+    digest = hashlib.sha256(canonical_signature.encode("utf-8")).hexdigest()[:8]
+    return SkillRule(
+        kind="avoid",
+        title=f"Recurring {tool} Error" if tool else "Recurring Tool Error",
+        trigger=(f"When a {tool} call fails repeatedly with the same error"
+                 if tool else "When a tool call fails repeatedly with the same error"),
+        guidance=(
+            "Check the failing precondition before repeating the call: this "
+            f"recurring error has signature {digest}. Read the "
+            "error text and fix its cause instead of retrying unchanged."),
+        why=why, evidence_session_ids=[alias], support=n,
+        origin=ORIGIN_OBJECTIVE,
+        # Terminal-only: the raw signature never enters agent context. It is
+        # still untrusted tool output being written to a TTY, so strip ANSI /
+        # control sequences — otherwise an OSC payload in an error message could
+        # drive the user's terminal (title rewrite, clipboard, hyperlink).
+        preview_note=f"error signature: {label}",
+    )
+
+
+def _ensure_objective_coverage(
+    rules: list[SkillRule],
+    corpus: SkillCorpus,
+    aliases: dict[str, str],
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> list[SkillRule]:
+    """Append one deterministic identity-bearing rule per objective candidate.
+
+    A model-provided ``evidence_session_ids`` alias is not proof that the rule
+    actually teaches that signal: an unrelated rule can cite the alias and used
+    to suppress the fallback.  Construction is the only deterministic coverage
+    proof, so every objective candidate gets its own fixed, signature-bound rule.
+    This may push the fresh set past MAX_RULES; ``merge_rules`` still caps the
+    installed set at 5, and the preview reports every objective rule that loses
+    that ranking instead of dropping it silently.
+    """
+    objective = [c for c in corpus.candidates if _is_objective_candidate(c)]
+    objective.sort(key=lambda c: -int(c.support_count or 0))
+    for candidate in objective:
+        fallback = _fallback_rule(candidate, aliases[candidate.session_id], anon, settings)
+        if fallback is not None:
+            rules.append(fallback)
+    return rules
+
+
+def _format_candidates(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None = None,
+) -> str:
+    lines: list[str] = []
+    if corpus.mode_recurrence:
+        top = ", ".join(f"{m}×{n}" for m, n in list(corpus.mode_recurrence.items())[:8])
+        lines.append(f"Recurring failure modes this window: {top}\n")
+    for c in corpus.candidates:
+        lines.append(
+            f"- session {aliases[c.session_id]} [{c.kind}] source={c.source} "
+            f"project={_scrub(c.project, anon, settings)}\n"
+            f"  support_count={c.support_count} impact={c.impact:.2f} "
+            f"recency={c.recency:.3f} rank_score={c.rank_score:.3f}\n"
+            f"  failure_modes={c.failure_modes} recovery={c.recovery_labels} "
+            f"resolution={c.resolution} failure_value={c.failure_value} quality={c.quality}\n"
+            f"  title={_scrub(c.title, anon, settings)}\n"
+            f"  learning_summary={_scrub(c.learning_summary, anon, settings)}\n"
+            f"  score_reason={_scrub(c.score_reason, anon, settings)}"
+        )
+        for i, t in enumerate(getattr(c, "pivotal_excerpts", []) or [], 1):
+            if hasattr(t, "correction"):        # human feedback (TurnExcerpt)
+                lines.append(
+                    f"  pivotal_turn_{i}:\n"
+                    f"    agent_before: {_scrub(t.before, anon, settings)}\n"
+                    f"    user_correction: {_scrub(t.correction, anon, settings)}\n"
+                    f"    agent_after: {_scrub(t.after, anon, settings)}"
+                )
+            else:                               # environment feedback (EnvExcerpt)
+                recovered = _scrub(t.recovery, anon, settings)
+                lines.append(
+                    f"  env_recovery_{i}:\n"
+                    f"    failed_action: {_scrub(t.action, anon, settings)}\n"
+                    f"    error: {_scrub(t.error, anon, settings)}\n"
+                    f"    working_action: {recovered or '(not recovered in-session)'}"
+                )
+    return "\n".join(lines)
+
+
+def build_prompt(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None = None,
+) -> str:
+    return (
+        "# Distill up to 5 durable skills from this user's own scored sessions.\n\n"
+        f"{_format_candidates(corpus, anon, aliases, settings)}"
+        f"{_must_cover_block(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
+    )
+
+
+class DefaultCaller:
+    """Production caller over ``run_default_agent_task`` (one call, no CI)."""
+
+    def __init__(self, backend: str = "auto", model: str | None = None,
+                 effort: str | None = None,
+                 timeout_seconds: int = DISTILL_TIMEOUT,
+                 use_default_distill_effort: bool = True,
+                 claude_safe_mode: bool = True) -> None:
+        self.resolved = resolve_backend(backend)
+        self.claude_safe_mode = claude_safe_mode
+        # Distill defaults to a frontier model and higher effort; explicit CLI
+        # overrides still win. Scoring defaults live in scoring.backends.
+        self.model = model or default_distill_model_for_backend(self.resolved)
+        self.effort = (
+            effort if effort is not None
+            else (default_distill_effort_for_backend(self.resolved)
+                  if use_default_distill_effort else None)
+        )
+        self.timeout_seconds = timeout_seconds
+
+    def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:
+        from .schema import SKILL_DISTILL_SCHEMA
+        # claude_safe_mode -> Claude Code runs WITHOUT auto-loading the installed
+        # openjournal-lessons skill / user CLAUDE.md, while still using normal auth.
+        # That keeps distillation grounded only in the passed corpus and prevents
+        # already-installed or --rejected rules from being re-emitted/reinforced.
+        return run_agent_json_call(
+            resolved=self.resolved, model=self.model, effort=self.effort,
+            system_prompt=system_prompt, task_prompt=task_prompt,
+            timeout_seconds=self.timeout_seconds,
+            codex_output_schema=SKILL_DISTILL_SCHEMA,
+            claude_safe_mode=self.claude_safe_mode,
+            claude_permission_mode="default",
+            claude_tools="",
+        )
+
+
+def distill_skills(
+    corpus: SkillCorpus,
+    *,
+    backend: str = "auto",
+    model: str | None = None,
+    effort: str | None = None,
+    caller: Caller | None = None,
+    cfg: dict | None = None,
+    redaction_settings: dict[str, Any] | None = None,
+) -> list[SkillRule]:
+    """Run the single distill call and return the validated SkillRules.
+
+    At most MAX_RULES come from the model; deterministic MUST-COVER rules may push
+    the total above that model-output cap — ``merge_rules`` still caps the
+    *installed* set. ``caller`` is injected in tests; default hits the user's own
+    agent CLI. ``cfg`` reuses an already-loaded config (for redact_usernames)
+    instead of re-reading it.
+    """
+    if corpus.is_empty():
+        return []
+    cfg = cfg if cfg is not None else load_config()
+    settings = redaction_settings or {
+        "custom_strings": list(cfg.get("redact_strings", []) or []),
+        "extra_usernames": list(cfg.get("redact_usernames", []) or []),
+        "blocked_domains": [],
+    }
+    anon = Anonymizer(extra_usernames=list(settings.get("extra_usernames", []) or []))
+    aliases = _candidate_aliases(corpus)  # computed once, reused for evidence back-mapping
+    task = build_prompt(corpus, anon, aliases, settings)
+    try:
+        # DefaultCaller() resolves the backend (a process/env lookup that can raise
+        # when no backend is installed), so build it INSIDE the degrade-gracefully guard.
+        call = caller or DefaultCaller(backend=backend, model=model, effort=effort)
+        data = call(system_prompt=_SYSTEM, task_prompt=task)
+    except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
+        msg = str(exc)
+        logger.warning("skill distill call failed: %s", exc)
+        # Only a default (caller-less, no explicit model/effort) frontier run is eligible
+        # for a graceful retry.
+        if caller is not None or model is not None or effort is not None:
+            return []
+        plan_issue = _distill_plan_unavailable(msg)      # frontier model unavailable on the plan
+        effort_issue = "--effort" in msg and _distill_flag_unsupported(msg)
+        # A TRANSIENT failure (timeout/network/parse) must NOT silently downgrade the
+        # model+effort with a misleading "model unavailable" message — degrade to [].
+        if not (plan_issue or effort_issue):
+            return []
+        try:
+            resolved = resolve_backend(backend)
+        except Exception:
+            return []
+        frontier = default_distill_model_for_backend(resolved)  # what the 1st try used
+        fast = default_model_for_backend(resolved)
+        can_downgrade = plan_issue and fast and fast != frontier
+        if not (can_downgrade or effort_issue):
+            return []  # nothing to relax (e.g. Codex plan issue where fast IS the frontier)
+        try:
+            # plan issue -> drop to the fast model; effort issue -> keep the frontier model
+            # but relax only the newer --effort flag an old CLI can't parse. Never relax
+            # Claude tool/permission isolation for untrusted trace excerpts.
+            data = DefaultCaller(
+                backend=resolved,
+                model=(fast if can_downgrade else None),
+                use_default_distill_effort=not effort_issue,
+            )(system_prompt=_SYSTEM, task_prompt=task)
+            why = ("the frontier distill model is unavailable on your plan" if plan_issue
+                   else "your agent CLI rejected the distill effort flag")
+            where = f" on {fast}" if can_downgrade else ""
+            print(f"note: {why}; retried with a compatible config{where}. "
+                  f"Pass --model / --effort to control it.")
+        except Exception:
+            return []
+    if not isinstance(data, dict):
+        try:
+            data = _extract_json_object(str(data))
+        except ValueError:
+            return []
+    rules = parse_rules(data)
+    allowed_aliases = set(aliases.values())
+    # A candidate's real support keyed by its rendered alias, so a rule inherits the
+    # recurrence of whatever it cites as evidence. This is the ONLY path that carries a
+    # synthetic env/rejection candidate's OBJECTIVE session count (e.g. 12 sessions of
+    # "file not read yet", 8 sessions of rejected actions) onto the emitted rule — those
+    # candidates carry no taxonomy, so the mode-recurrence backfill below can't see them,
+    # and the rule would otherwise display a coincidental judge count (or ~0). Max over
+    # colliding aliases: a synthetic candidate may reuse a real pool session id.
+    support_by_alias: dict[str, int] = {}
+    for c in corpus.candidates:
+        alias = aliases.get(c.session_id)
+        if alias is not None:
+            support_by_alias[alias] = max(support_by_alias.get(alias, 0), int(c.support_count or 0))
+    for r in rules:
+        evidence: list[str] = []
+        for sid in r.evidence_session_ids:
+            if sid in aliases:
+                evidence.append(aliases[sid])
+            elif sid in allowed_aliases:
+                evidence.append(sid)
+        r.evidence_session_ids = list(dict.fromkeys(evidence))
+        # backfill support from recurrence where the rule named a mode...
+        if r.taxonomy and r.taxonomy in corpus.mode_recurrence:
+            r.support = max(r.support, corpus.mode_recurrence[r.taxonomy])
+        # ...and from the real support of any candidate the rule cites as evidence.
+        cited = [support_by_alias[a] for a in r.evidence_session_ids if a in support_by_alias]
+        if cited:
+            r.support = max(r.support, max(cited))
+    # CH-2 must-cover: every objective candidate gets a deterministic,
+    # identity-bearing rule.  A model citation alone cannot prove semantic
+    # coverage.  This only happens after a SUCCESSFUL call; a backend failure
+    # above still degrades to [], unchanged.
+    return _ensure_objective_coverage(rules, corpus, aliases, anon, settings)

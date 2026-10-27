@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "openjournal",
+  "version": "0.2.0",
+  "description": "OpenJournal — review, curate, and share your coding agent conversation traces. 100% local. Scans sessions from Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline. Auto-redacts secrets and PII. Browser workbench for triage and export.",
+  "owner": {
+    "name": "anonymous-org",
+    "url": "https://github.com/anonymous-org"
+  },
+  "plugins": [
+    {
+      "name": "openjournal",
+      "description": "OpenJournal agent skills: /openjournal-setup (install + scan + launch workbench), /openjournal (review, triage, and share traces), and /openjournal-score (AI-assisted quality scoring).",
+      "version": "0.2.0",
+      "author": {
+        "name": "anonymous-org",
+        "url": "https://github.com/anonymous-org"
+      },
+      "source": "../plugins/openjournal",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openjournal"
+version = "0.2.0"
+description = "Review, score, and curate your coding agent conversation traces locally"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [
+    {name = "anonymous-org"},
+]
+keywords = ["claude-code", "claude-science", "codex", "gemini-cli", "opencode", "openclaw", "workbuddy", "dataset", "conversations"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "prompt_toolkit>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/anonymous-org/openjournal"
+Issues = "https://github.com/anonymous-org/openjournal/issues"
+
+[project.scripts]
+openjournal = "openjournal.cli:main"
+openshare = "openjournal.share_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openjournal*"]
+exclude = ["openjournal.web*"]
+
+[tool.setuptools.package-data]
+"openjournal" = [
+    "assets/*.png",
+    "prompts/agents/*/*.md",
+    "web/frontend/dist/**/*",
+    "events/docs/*.md",
+    "events/docs/_features.yaml",
+    "redaction/*.toml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "tomli; python_version < '3.11'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

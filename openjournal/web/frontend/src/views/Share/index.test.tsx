@@ -1,0 +1,936 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api, ApiError } from '../../api.ts';
+import { ToastProvider } from '../../components/Toast.tsx';
+import type { ReadySession, ShareReadyStats } from './types.ts';
+import { Share } from './index.tsx';
+
+function LocationProbe() {
+  return <output data-testid="location-search">{useLocation().search}</output>;
+}
+
+function NavigationProbe({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate(to)}>Navigate</button>;
+}
+
+function readySession(id: string): ReadySession {
+  return {
+    session_id: id,
+    project: 'project-a',
+    model: 'gpt-test',
+    source: 'codex',
+    display_title: `Trace ${id}`,
+    ai_quality_score: 4,
+    ai_failure_value_score: 3,
+    ai_recovery_labels: [],
+    ai_failure_attribution: null,
+    ai_failure_modes: [],
+    ai_learning_summary: null,
+    user_messages: 1,
+    assistant_messages: 1,
+    tool_uses: 0,
+    input_tokens: 100,
+    output_tokens: 50,
+    outcome_badge: 'resolved',
+    start_time: '2026-07-15T12:00:00Z',
+    review_status: 'approved',
+  };
+}
+
+function readyStats(count = 12): ShareReadyStats {
+  const sessions = Array.from({ length: count }, (_, index) => readySession(`s${index + 1}`));
+  return {
+    count: sessions.length,
+    total_approved: sessions.length,
+    projects: ['project-a'],
+    models: ['gpt-test'],
+    recommended_session_ids: ['s1'],
+    sessions,
+  };
+}
+
+function mockInitialLoad(stats: ShareReadyStats) {
+  vi.spyOn(api, 'shareReady').mockResolvedValue(
+    stats as Awaited<ReturnType<typeof api.shareReady>>,
+  );
+  vi.spyOn(api.shares, 'list').mockResolvedValue([]);
+  vi.spyOn(api, 'scoringBackend').mockResolvedValue({ backend: null, display_name: null });
+  vi.spyOn(api, 'shareDestination').mockResolvedValue({
+    configured: false,
+    daemon_upload_supported: false,
+    submissions_open: false,
+    preferred_upload_flow: 'manual',
+    cli_ingest_supported: false,
+    share_page_url: null,
+  });
+}
+
+afterEach(() => {
+  window.localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe('Reviewed share versions', () => {
+  it('clears saved reviews only after confirmation and reports the result', async () => {
+    mockInitialLoad(readyStats(1));
+    const clear = vi.spyOn(api.shares, 'clearReviews').mockResolvedValue({ ok: true });
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear saved reviews' }));
+    expect(screen.getByText(/Unsubmitted packages will need new reviews/)).toBeInTheDocument();
+    expect(clear).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear reviews' }));
+    await waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/Saved reviews cleared/)).toBeInTheDocument();
+  });
+
+  it.each([true, false])('requires the saved preview and uses its revision (available=%s)', async (available) => {
+    const stats = readyStats(1);
+    stats.sessions[0].revision_hash = 'older-queue-revision';
+    mockInitialLoad(stats);
+    vi.spyOn(api.sessions, 'redactionReport').mockResolvedValue({
+      session_id: 's1',
+      review_snapshot_id: available ? 'saved-preview' : undefined,
+      reviewed_revision: available ? 'actually-reviewed-revision' : undefined,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [{ role: 'user', content: 'Reviewed content' }] },
+    } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+    const create = vi.spyOn(api.shares, 'create').mockResolvedValue({ share_id: 'snapshot-share' });
+    vi.spyOn(api.shares, 'seal').mockResolvedValue({ ok: true } as Awaited<ReturnType<typeof api.shares.seal>>);
+    vi.spyOn(api.shares, 'packageStatus').mockResolvedValue({ progress: 100, message: 'Ready' } as Awaited<ReturnType<typeof api.shares.packageStatus>>);
+    render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText(available ? 'Redaction complete' : 'Redaction finished with failed previews')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByText(/Later changes stay local for a future share/)).toBeInTheDocument();
+    if (available) {
+      fireEvent.click(screen.getByRole('button', { name: 'Package 1 trace' }));
+      await waitFor(() => expect(create).toHaveBeenCalledWith(
+        ['s1'], undefined, undefined,
+        { s1: 'actually-reviewed-revision' }, expect.any(Object),
+        { s1: 'saved-preview' },
+      ));
+    } else {
+      expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+      expect(screen.getByText('not included · 1 preview failed')).toBeInTheDocument();
+      expect(create).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('Share selection defaults', () => {
+  it('opens the picker with every available trace selected and lets the user deselect', async () => {
+    mockInitialLoad(readyStats());
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide traces' })).toHaveAttribute('aria-expanded', 'true');
+
+    const first = screen.getByRole('checkbox', { name: 'Include trace: Trace s1' });
+    const last = screen.getByRole('checkbox', { name: 'Include trace: Trace s12' });
+    expect(first).toBeChecked();
+    expect(last).toBeChecked();
+
+    fireEvent.click(first);
+    await waitFor(() => expect(first).not.toBeChecked());
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.get('exclude')).toBe('s1');
+    });
+    expect(last).toBeChecked();
+
+    fireEvent.click(first);
+    await waitFor(() => expect(first).toBeChecked());
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.has('exclude')).toBe(false);
+    });
+  });
+
+  it('preselects only approved traces and counts them, keeping unapproved ones pickable', async () => {
+    // Regression test for issue #201: the widened pool returns unapproved
+    // (new/shortlisted) traces for the picker, but they must not appear as
+    // "will be shared" nor inflate the selection counter.
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 4,
+      total_approved: 2,
+      recommended_session_ids: [],
+      sessions: [
+        readySession('s1'),
+        { ...readySession('s2'), review_status: 'new' },
+        readySession('s3'),
+        { ...readySession('s4'), review_status: 'shortlisted' },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s3' })).toBeChecked();
+    const unapproved = screen.getByRole('checkbox', { name: 'Include trace: Trace s2' });
+    expect(unapproved).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s4' })).not.toBeChecked();
+    expect(screen.getByText('not approved (new)')).toBeInTheDocument();
+    expect(screen.getByText('not approved (shortlisted)')).toBeInTheDocument();
+
+    // Explicitly opting an unapproved trace in still works from the picker.
+    fireEvent.click(unapproved);
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+  });
+
+  it('shows one conversation while selecting and redacting every eligible checkpoint', async () => {
+    const root: ReadySession = {
+      ...readySession('long-trace'),
+      display_title: 'Long conversation',
+      logical_session_id: 'long-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 3,
+      segment_index: 0,
+      revision_hash: 'physical-r0',
+    };
+    const tail: ReadySession = {
+      ...readySession('long-trace_seg-0001'),
+      display_title: 'Long conversation',
+      logical_session_id: 'long-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 3,
+      segment_index: 1,
+      revision_hash: 'physical-r1',
+    };
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 2,
+      total_approved: 2,
+      recommended_session_ids: ['long-trace'],
+      sessions: [root, tail],
+    });
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'disabled',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('1 conversation / 2 upload checkpoints selected')).toBeInTheDocument();
+    expect(screen.getByText('2 eligible of 3 upload checkpoints')).toBeInTheDocument();
+    expect(screen.getAllByText('Long conversation')).toHaveLength(1);
+    expect(screen.getAllByRole('checkbox', { name: 'Include conversation: Long conversation' })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include conversation: Long conversation' }));
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include conversation: Long conversation' }));
+    expect(await screen.findByText('1 conversation / 2 upload checkpoints selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual([
+      'long-trace',
+      'long-trace_seg-0001',
+    ]);
+  });
+
+  it('fails closed when a conversation checkpoint sequence is incomplete', async () => {
+    const incomplete: ReadySession = {
+      ...readySession('incomplete-trace'),
+      logical_session_id: 'incomplete-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 2,
+      segment_index: 0,
+      logical_incomplete: true,
+    };
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 1,
+      total_approved: 1,
+      recommended_session_ids: ['incomplete-trace'],
+      sessions: [incomplete],
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include conversation: Trace incomplete-trace' })).toBeDisabled();
+    expect(screen.getByText('Checkpoint sequence incomplete')).toBeInTheDocument();
+  });
+
+  it('keeps a custom queue order when bulk-selecting filtered traces', async () => {
+    mockInitialLoad(readyStats(3));
+
+    render(
+      <MemoryRouter initialEntries={['/share?ids=s2,s1']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search traces by title or project' }), {
+      target: { value: 's3' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Select 1 filtered' }));
+
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('ids')).toBe('s2,s1,s3');
+      expect(params.has('selection')).toBe(false);
+    });
+  });
+
+  it('restores default queue order when bulk selection completes a default subset', async () => {
+    mockInitialLoad(readyStats(3));
+
+    render(
+      <MemoryRouter initialEntries={['/share?ids=s1,s3']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Select all 3' }));
+
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.has('ids')).toBe(false);
+    });
+  });
+
+  it('caps bulk selection at 50 traces', async () => {
+    mockInitialLoad(readyStats(75));
+
+    render(
+      <MemoryRouter initialEntries={['/share?ids=']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Select first 50 (50 max)' }));
+
+    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(screen.queryByText(/Added 50 traces/)).not.toBeInTheDocument();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.has('ids')).toBe(false);
+    });
+  });
+
+  it('caps a large eligible history at 50 selected traces while keeping the rest browsable', async () => {
+    mockInitialLoad(readyStats(125));
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(screen.getAllByRole('checkbox', { name: /Include trace:/ })).toHaveLength(50);
+    expect(screen.getByText(/Showing 50 of 125 matching traces/)).toBeInTheDocument();
+    expect(screen.getByText(/Only selected traces are in this bundle \(50 maximum\)/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '50 trace limit reached' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Show 50 more/ }));
+    expect(screen.getAllByRole('checkbox', { name: /Include trace:/ })).toHaveLength(100);
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' }));
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' }));
+    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeChecked();
+  }, 10_000);
+
+  it('prunes stale queue ids when eligibility refreshes after a completed bundle', async () => {
+    const initialStats = readyStats(50);
+    const refreshedSessions = ['s51', 's52', 's53'].map(readySession);
+    const refreshedStats: ShareReadyStats = {
+      ...readyStats(0),
+      count: refreshedSessions.length,
+      total_approved: refreshedSessions.length,
+      recommended_session_ids: ['s51'],
+      sessions: refreshedSessions,
+    };
+    mockInitialLoad(initialStats);
+    vi.mocked(api.shareReady)
+      .mockResolvedValueOnce(initialStats as Awaited<ReturnType<typeof api.shareReady>>)
+      .mockResolvedValueOnce(refreshedStats as Awaited<ReturnType<typeof api.shareReady>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=completed-share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Start a new bundle' }));
+
+    await waitFor(() => expect(api.shareReady).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    const replacement = screen.getByRole('checkbox', { name: 'Include trace: Trace s51' });
+    expect(replacement).toBeEnabled();
+
+    fireEvent.click(replacement);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    expect(replacement).toBeChecked();
+  });
+
+  it('sanitizes duplicate and ineligible ids from deep links after ready state loads', async () => {
+    mockInitialLoad(readyStats(3));
+
+    render(
+      <MemoryRouter initialEntries={['/share?ids=s2,s2,blocked']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s2' })).toBeChecked();
+    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('ids=s2'));
+  });
+
+  it('restores the latest URL selection when navigation wins the initial-load race', async () => {
+    let resolveReady!: (stats: Awaited<ReturnType<typeof api.shareReady>>) => void;
+    vi.spyOn(api, 'shareReady').mockReturnValue(new Promise((resolve) => { resolveReady = resolve; }));
+    vi.spyOn(api.shares, 'list').mockResolvedValue([]);
+    vi.spyOn(api, 'scoringBackend').mockResolvedValue({ backend: null, display_name: null });
+    vi.spyOn(api, 'shareDestination').mockResolvedValue({
+      configured: false,
+      daemon_upload_supported: false,
+      submissions_open: false,
+      preferred_upload_flow: 'manual',
+      cli_ingest_supported: false,
+      share_page_url: null,
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+        <NavigationProbe to="/share?ids=s1" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate' }));
+    resolveReady(readyStats(2) as Awaited<ReturnType<typeof api.shareReady>>);
+
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s2' })).not.toBeChecked();
+    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('ids=s1'));
+  });
+
+  it('caps the default queue before rejecting an unlocked Redact deep link', async () => {
+    mockInitialLoad(readyStats(125));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['redact', 'review', 'package'] as const)(
+    'rejects an unpackaged %s deep link without a locked exact selection',
+    async (step) => {
+      mockInitialLoad(readyStats(3));
+      const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+      const packageSpy = vi.spyOn(api.shares, 'create');
+
+      render(
+        <MemoryRouter initialEntries={[`/share?step=${step}&ai_pii=1`]}>
+          <ToastProvider><Share /></ToastProvider>
+          <LocationProbe />
+        </MemoryRouter>,
+      );
+
+      expect(await screen.findByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
+      expect(redactionSpy).not.toHaveBeenCalled();
+      expect(packageSpy).not.toHaveBeenCalled();
+      await waitFor(() => {
+        const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+        expect(params.has('step')).toBe(false);
+        expect(params.get('selection')).not.toBe('locked');
+      });
+    },
+  );
+
+  it('reloads a default-all queue from its locked IDs without adding a newly eligible trace', async () => {
+    mockInitialLoad(readyStats(2));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    const firstView = render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    const lockedSearch = screen.getByTestId('location-search').textContent || '';
+    const lockedParams = new URLSearchParams(lockedSearch);
+    expect(lockedParams.get('step')).toBe('redact');
+    expect(lockedParams.get('ids')).toBe('s1,s2');
+    expect(lockedParams.get('selection')).toBe('locked');
+
+    firstView.unmount();
+    vi.mocked(api.shareReady).mockResolvedValue(
+      readyStats(3) as Awaited<ReturnType<typeof api.shareReady>>,
+    );
+    redactionSpy.mockClear();
+
+    render(
+      <MemoryRouter initialEntries={[`/share${lockedSearch}`]}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual(['s1', 's2']);
+    expect(redactionSpy).not.toHaveBeenCalledWith('s3', expect.anything());
+    expect(redactionSpy.mock.calls.every(([, options]) => options?.aiPii === true)).toBe(true);
+  });
+
+  it('locks only the capped 50-trace snapshot without adding a newly eligible trace', async () => {
+    const ids = Array.from({ length: 80 }, (_, index) => `session-${index.toString().padStart(4, '0')}`);
+    const stats: ShareReadyStats = {
+      ...readyStats(0),
+      count: ids.length,
+      total_approved: ids.length,
+      recommended_session_ids: [ids[0]],
+      sessions: ids.map(readySession),
+    };
+    mockInitialLoad(stats);
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(
+      () => new Promise(() => {}),
+    );
+
+    const firstView = render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+
+    let lockedSearch = '';
+    await waitFor(() => {
+      lockedSearch = screen.getByTestId('location-search').textContent || '';
+      const params = new URLSearchParams(lockedSearch);
+      expect(params.get('step')).toBe('redact');
+      expect(params.get('selection')).toBe('locked');
+      expect((params.get('ids') || '').split(',')).toEqual(ids.slice(0, 50));
+      expect(params.has('queue_ref')).toBe(false);
+    });
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+
+    firstView.unmount();
+    const newlyEligible = 'newly-eligible-trace';
+    vi.mocked(api.shareReady).mockResolvedValue({
+      ...stats,
+      count: stats.count + 1,
+      total_approved: stats.total_approved + 1,
+      sessions: [...stats.sessions, readySession(newlyEligible)],
+    } as Awaited<ReturnType<typeof api.shareReady>>);
+    redactionSpy.mockClear();
+
+    render(
+      <MemoryRouter initialEntries={[`/share${lockedSearch}`]}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    expect(redactionSpy).not.toHaveBeenCalledWith(newlyEligible, expect.anything());
+  });
+
+  it('rejects a locked downstream URL when its queue reference is missing', async () => {
+    mockInitialLoad(readyStats(3));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&queue_ref=missing&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Share' })).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
+  });
+
+  it('keeps a stale locked snapshot on Queue after the user selects a new trace', async () => {
+    mockInitialLoad(readyStats(2));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&ids=no-longer-eligible&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Share' })).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' }));
+
+    expect(await screen.findByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
+  });
+
+  it('resumes an existing packaged large share without restarting queue work', async () => {
+    mockInitialLoad(readyStats(125));
+    vi.mocked(api.shareDestination).mockResolvedValue({
+      configured: true,
+      daemon_upload_supported: true,
+      submissions_open: true,
+      preferred_upload_flow: 'daemon',
+      cli_ingest_supported: false,
+      share_page_url: null,
+    });
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=submit&share=existing']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Submit to OpenJournal Research' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'What would you like to share?' })).not.toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+  });
+
+  it('reports a hosted submission only after its receipt is restored', async () => {
+    mockInitialLoad(readyStats(1));
+    vi.spyOn(api.shares, 'get').mockResolvedValue({
+      share_id: 'submitted-share',
+      created_at: '2026-07-22T12:00:00Z',
+      session_count: 1,
+      status: 'shared',
+      attestation: null,
+      submission_note: null,
+      bundle_hash: 'bundle-hash',
+      manifest: {},
+      shared_at: '2026-07-22T12:01:00Z',
+      hosted_receipt_id: 'receipt-123',
+      hosted_status: 'accepted',
+    });
+    const onSubmittedShareChange = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=submitted-share']}>
+        <ToastProvider>
+          <Share onSubmittedShareChange={onSubmittedShareChange} />
+        </ToastProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(onSubmittedShareChange).toHaveBeenLastCalledWith('submitted-share');
+    });
+    expect(await screen.findByRole('heading', { name: 'Submitted' })).toBeInTheDocument();
+  });
+
+  it('ignores a stale receipt response after navigating to another share', async () => {
+    mockInitialLoad(readyStats(1));
+    type ShareResult = Awaited<ReturnType<typeof api.shares.get>>;
+    let resolveFirst!: (share: ShareResult) => void;
+    const firstRequest = new Promise<ShareResult>((resolve) => { resolveFirst = resolve; });
+    const shareResult = (shareId: string, receiptId: string | null): ShareResult => ({
+      share_id: shareId,
+      created_at: '2026-07-22T12:00:00Z',
+      session_count: 1,
+      status: receiptId ? 'shared' : 'draft',
+      attestation: null,
+      submission_note: null,
+      bundle_hash: 'bundle-hash',
+      manifest: {},
+      shared_at: receiptId ? '2026-07-22T12:01:00Z' : null,
+      hosted_receipt_id: receiptId,
+      hosted_status: receiptId ? 'accepted' : null,
+    });
+    vi.spyOn(api.shares, 'get').mockImplementation((shareId) => (
+      shareId === 'first-share'
+        ? firstRequest
+        : Promise.resolve(shareResult('second-share', null))
+    ));
+    const onSubmittedShareChange = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=first-share']}>
+        <ToastProvider>
+          <Share onSubmittedShareChange={onSubmittedShareChange} />
+        </ToastProvider>
+        <NavigationProbe to="/share?step=done&share=second-share" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('first-share'));
+    expect(await screen.findByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    // Let initial queue hydration finish so this test isolates the receipt race.
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate' }));
+    await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('second-share'));
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('share')).toBe('second-share');
+    });
+
+    await act(async () => {
+      resolveFirst(shareResult('first-share', 'receipt-first'));
+      await firstRequest;
+    });
+
+    expect(screen.getByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Submitted' })).not.toBeInTheDocument();
+    expect(onSubmittedShareChange).not.toHaveBeenCalledWith('second-share');
+  });
+});
+
+describe('Redaction completion', () => {
+  it('settles every queued trace when reloading a locked redact deep link', async () => {
+    mockInitialLoad(readyStats(2));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&ids=s1,s2&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
+
+    // The reports resolve, but the run releases its slot before React applies
+    // their state updates. Re-checking liveness inside the updater dropped
+    // them, pinning the trace at `loading` with no request left in flight.
+    await waitFor(() => {
+      expect(document.body.textContent || '').toContain('Redaction complete');
+    }, { timeout: 3000 });
+
+    // And it must settle without spinning: one report per queued trace.
+    expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual(['s1', 's2']);
+  });
+});
+
+describe('One-click review defaults', () => {
+  it('auto-includes deterministic-only traces and preserves a manual exclusion', async () => {
+    mockInitialLoad(readyStats(2));
+    vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'disabled',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Ready to package' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Package 2 traces' })).toBeEnabled();
+    expect(screen.queryByText('Trace s1')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Trace s1'));
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude from bundle' }));
+    expect(screen.getByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Back to redaction/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+  });
+
+  it('leaves an AI-unavailable trace out without blocking the safe subset', async () => {
+    mockInitialLoad(readyStats(2));
+    vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: id === 's1' ? 'full' : 'rules_only',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+    expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
+    expect(screen.getByText('not included · 1 need review')).toBeInTheDocument();
+  });
+});
+
+
+describe('Failed saved previews', () => {
+  it.each([422, 408])('packages the healthy subset after a %i failure', async (status) => {
+    mockInitialLoad(readyStats(3));
+    const report = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => {
+      if (id === 's3') throw new ApiError(status, 'Synthetic preview boundary needs an explicit redaction.');
+      return {
+        session_id: id, review_snapshot_id: `preview-${id}`, reviewed_revision: `revision-${id}`,
+        redaction_count: 0, redaction_log: [], ai_pii_findings: [], ai_coverage: 'disabled',
+        redacted_session: { messages: [{ role: 'user', content: 'Safe synthetic content' }] },
+      } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>;
+    });
+    const create = vi.spyOn(api.shares, 'create').mockResolvedValue({ share_id: 'safe-subset' });
+    vi.spyOn(api.shares, 'export').mockResolvedValue({} as Awaited<ReturnType<typeof api.shares.export>>);
+    vi.spyOn(api.shares, 'packageStatus').mockResolvedValue({ progress: 100, message: 'Ready' } as Awaited<ReturnType<typeof api.shares.packageStatus>>);
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Package 2 traces' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toEqual(['s1', 's2']);
+    expect(report.mock.calls.filter(([id]) => id === 's3')).toHaveLength(1);
+  });
+
+  it('the Redact stepper refreshes a failed preview and requires inclusion again', async () => {
+    mockInitialLoad(readyStats(1));
+    const report = vi.spyOn(api.sessions, 'redactionReport')
+      .mockRejectedValueOnce(new ApiError(422, 'Add an explicit redaction before sharing.'))
+      .mockResolvedValue({
+        session_id: 's1', review_snapshot_id: 'refreshed', reviewed_revision: 'new-revision',
+        redaction_count: 0, redaction_log: [], ai_pii_findings: [], ai_coverage: 'disabled',
+        redacted_session: { messages: [] },
+      } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Inspect'));
+    expect(screen.getByRole('alert')).toHaveTextContent('Add an explicit redaction before sharing.');
+    expect(screen.queryByText('Nothing matched the deterministic rules.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Include in bundle' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Include in bundle' })).toHaveStyle({ opacity: '0.4', cursor: 'not-allowed' });
+    expect(screen.getByText('preview failed · cannot include')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Redact$/ }));
+    await waitFor(() => expect(report).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+  });
+});
